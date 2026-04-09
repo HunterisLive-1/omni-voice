@@ -1,0 +1,23 @@
+# OmniVoice — Web UI + demo
+# -------------------------
+# Pehle PyTorch + TorchAudio apne GPU/CPU ke hisaab se (README / pytorch.org):
+#
+#   CPU:
+#     pip install torch==2.8.0 torchaudio==2.8.0
+#
+#   NVIDIA CUDA 12.8:
+#     pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+#
+# Phir:
+#     pip install -r requirements.txt
+#
+# Windows one-click: setup.bat install
+#
+# Errors / repairs — only setup.bat + run.bat in this repo:
+#   Double-click setup.bat (menu) or: setup.bat fixhttpx | fixaccelerate | deeprepair | repairomni
+#   setup.bat verify | torchcu128 | torchcpu
+
+omnivoice
+accelerate>=1.0
+flask>=3.0
+# Never: pip install --force-reinstall accelerate  without  --no-deps  (pip pulls CPU torch 2.11 and breaks torchaudio+cu128)

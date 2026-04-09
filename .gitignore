@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.wav
+.env
+.env.local
+*.egg-info/
+dist/
+build/
+
+# Large weights — not on GitHub (2 GiB file limit). Download via Hugging Face / setup.bat weights.
+/model.safetensors
+/audio_tokenizer/model.safetensors
+*.safetensors
