@@ -7,15 +7,23 @@ set "VPY=%VENV_DIR%\Scripts\python.exe"
 set "SP=%VENV_DIR%\Lib\site-packages"
 
 REM ---------------------------------------------------------------------------
-REM  OmniVoice — single setup + repair entry (only batch file besides run.bat)
-REM    setup.bat              First install, or menu if .venv exists
-REM    setup.bat install      Full install / upgrade (non-interactive shortcut)
-REM    setup.bat run          Web UI (same as run.bat)
+REM  OmniVoice — one-click setup + repair (only batch file besides run.bat)
+REM
+REM    setup.bat              FULLY AUTOMATIC — detects PC specs, installs
+REM                           everything, downloads weights, starts Web UI.
+REM                           Just double-click. Zero prompts.
+REM
+REM    setup.bat menu         Open advanced repair / tools menu
+REM    setup.bat install      Full install / upgrade (no auto-launch)
+REM    setup.bat run          Start Web UI (same as run.bat)
 REM    setup.bat verify | fixhttpx | fixaccelerate | deeprepair | repairomni
 REM    setup.bat torchcu128 | torchcu124 | torchcu121 | torchcu118 | torchcpu
-REM    setup.bat weights   — pre-download HF model files (~several GB^)
+REM    setup.bat weights      Pre-download Hugging Face model files
 REM ---------------------------------------------------------------------------
 
+set "AUTO_MODE=0"
+
+if /i "%~1"=="menu" goto :menu
 if /i "%~1"=="run" goto :run
 if /i "%~1"=="install" goto :install
 if /i "%~1"=="weights" goto :download_weights_cli
@@ -30,8 +38,24 @@ if /i "%~1"=="torchcu121" goto :reinstall_torch_cu121_cli
 if /i "%~1"=="torchcu118" goto :reinstall_torch_cu118_cli
 if /i "%~1"=="torchcpu" goto :reinstall_torch_cpu_cli
 
-if not exist "%VENV_DIR%\Scripts\activate.bat" goto :install
-goto :menu
+REM ---- No args: fully automatic flow ----
+set "AUTO_MODE=1"
+
+REM If .venv already exists and omnivoice+flask import OK, just launch Web UI
+if exist "%VENV_DIR%\Scripts\activate.bat" (
+  "%VPY%" -c "import flask, omnivoice" >nul 2>&1
+  if not errorlevel 1 (
+    echo.
+    echo  OmniVoice is already installed. Starting Web UI...
+    echo  ^(Tip: run  setup.bat menu  for repair tools^)
+    echo.
+    goto :run
+  )
+  echo.
+  echo  .venv exists but packages are broken — reinstalling...
+  echo.
+)
+goto :install
 
 REM ===========================================================================
 :menu
@@ -454,10 +478,14 @@ exit /b 0
 
 REM ===========================================================================
 :install
+cls
 echo.
-echo ========================================
-echo  OmniVoice - Windows install
-echo ========================================
+echo ================================================================
+echo   OmniVoice — Automatic installer ^(Windows^)
+echo   Detecting your PC specs and installing everything...
+echo ================================================================
+echo.
+echo   [Step 1 of 5]  Checking Python installation...
 echo.
 
 set "PYEXE="
@@ -466,43 +494,74 @@ if not defined PYEXE (
   where python >nul 2>&1 && set "PYEXE=python"
 )
 if not defined PYEXE (
-  echo ERROR: Python 3 not found. Install from https://www.python.org/downloads/
-  echo        Enable "Add python.exe to PATH" or use the "py" launcher.
+  echo  ================================================================
+  echo   ERROR: Python 3 is not installed ^(or not in PATH^)
+  echo  ================================================================
+  echo.
+  echo   Please install Python 3.10, 3.11, or 3.12:
+  echo.
+  echo     1^) Open:  https://www.python.org/downloads/
+  echo     2^) Download the latest Python 3.12 installer
+  echo     3^) IMPORTANT: tick "Add python.exe to PATH" during install
+  echo     4^) Restart this computer ^(or open a NEW cmd window^)
+  echo     5^) Double-click setup.bat again
+  echo.
+  echo   Tip on Windows 11: you can also install via
+  echo     winget install Python.Python.3.12
   echo.
   pause
   exit /b 1
 )
 
+REM Verify the Python version is supported (3.9 - 3.13)
+%PYEXE% -c "import sys; v=sys.version_info; exit(0 if (3,9) <= (v.major,v.minor) <= (3,13) else 1)" >nul 2>&1
+if errorlevel 1 (
+  echo  ================================================================
+  echo   ERROR: Your Python version is too old or too new.
+  echo  ================================================================
+  %PYEXE% -c "import sys; print('  Detected Python:', sys.version.split()[0])"
+  echo   OmniVoice needs Python 3.9 - 3.13 ^(3.12 recommended^).
+  echo   Download: https://www.python.org/downloads/
+  echo.
+  pause
+  exit /b 1
+)
+for /f "delims=" %%V in ('%PYEXE% -c "import sys;print(sys.version.split()[0])"') do set "_PYV=%%V"
+echo   OK: Python %_PYV% found.
+echo.
+
+REM -----------------------------------------------------------------
+echo   [Step 2 of 5]  Creating virtual environment ^(.venv^)...
+echo.
 if not exist "%VENV_DIR%\Scripts\activate.bat" (
-  echo Creating virtual environment: .venv
   %PYEXE% -m venv "%VENV_DIR%"
   if errorlevel 1 (
-    echo ERROR: Failed to create venv.
+    echo  ERROR: Failed to create venv.
+    echo  Try running this as Administrator, or check antivirus settings.
     echo.
     pause
     exit /b 1
   )
+  echo   OK: virtual environment created.
 ) else (
-  echo Using existing virtual environment: .venv
+  echo   OK: using existing .venv.
 )
 
 if not exist "%VPY%" (
-  echo ERROR: venv python missing: %VPY%
+  echo  ERROR: venv python missing: %VPY%
+  echo  Delete the .venv folder and run setup.bat again.
   echo.
   pause
   exit /b 1
 )
 
 call "%VENV_DIR%\Scripts\activate.bat"
-"%VPY%" -m pip install --upgrade pip
-if errorlevel 1 (
-  echo.
-  pause
-  exit /b 1
-)
-
+"%VPY%" -m pip install --upgrade pip --quiet
 echo.
-echo Detecting NVIDIA GPU and CUDA driver version...
+
+REM -----------------------------------------------------------------
+echo   [Step 3 of 5]  Detecting GPU ^& selecting PyTorch build...
+echo.
 set "_DETECT=none|cpu"
 "%VPY%" -c "import subprocess,re,sys; r=subprocess.run(['nvidia-smi'],capture_output=True,text=True,timeout=10); m=re.search(r'CUDA Version: (\d+)\.(\d+)',r.stdout); mj,mn=(int(m.group(1)),int(m.group(2))) if m else (0,0); v=mj*10+mn; rec='cu128' if v>=128 else 'cu124' if v>=124 else 'cu121' if v>=121 else 'cu118' if v>=118 else 'cpu'; print(str(mj)+'.'+str(mn)+'|'+rec if m else 'none|cpu')" >"%TEMP%\ov_detect.tmp" 2>nul
 if exist "%TEMP%\ov_detect.tmp" (
@@ -516,95 +575,119 @@ for /f "tokens=1,2 delims=|" %%A in ("!_DETECT!") do (
     set "_REC_BUILD=%%B"
 )
 
+REM Get GPU name (nicer output)
+set "_GPU_NAME="
+for /f "delims=" %%G in ('nvidia-smi --query-gpu^=name --format^=csv^,noheader 2^>nul') do (
+    if not defined _GPU_NAME set "_GPU_NAME=%%G"
+)
+
 set "_AUTO=5"
 set "_AUTO_LABEL=CPU only"
 if "!_CUDA_VER!"=="none" (
-    echo   No NVIDIA GPU detected ^(nvidia-smi not found or no GPU^).
+    echo   No NVIDIA GPU detected.
+    echo   -^> Installing CPU build of PyTorch ^(will work but slower^).
 ) else (
-    echo   NVIDIA GPU found — driver CUDA version: !_CUDA_VER!
-    if "!_REC_BUILD!"=="cu128" ( set "_AUTO=1" & set "_AUTO_LABEL=CUDA 12.8 ^(recommended^)" )
-    if "!_REC_BUILD!"=="cu124" ( set "_AUTO=3" & set "_AUTO_LABEL=CUDA 12.4 ^(recommended^)" )
-    if "!_REC_BUILD!"=="cu121" ( set "_AUTO=4" & set "_AUTO_LABEL=CUDA 12.1 ^(recommended^)" )
-    if "!_REC_BUILD!"=="cu118" ( set "_AUTO=2" & set "_AUTO_LABEL=CUDA 11.8 ^(recommended^)" )
-    if "!_REC_BUILD!"=="cpu"   ( set "_AUTO=5" & set "_AUTO_LABEL=CPU only — driver too old, please update NVIDIA drivers" )
+    if defined _GPU_NAME (
+        echo   GPU found: !_GPU_NAME!
+    ) else (
+        echo   NVIDIA GPU found.
+    )
+    echo   Driver CUDA version: !_CUDA_VER!
+    if "!_REC_BUILD!"=="cu128" ( set "_AUTO=1" & set "_AUTO_LABEL=CUDA 12.8" )
+    if "!_REC_BUILD!"=="cu124" ( set "_AUTO=3" & set "_AUTO_LABEL=CUDA 12.4" )
+    if "!_REC_BUILD!"=="cu121" ( set "_AUTO=4" & set "_AUTO_LABEL=CUDA 12.1" )
+    if "!_REC_BUILD!"=="cu118" ( set "_AUTO=2" & set "_AUTO_LABEL=CUDA 11.8" )
+    if "!_REC_BUILD!"=="cpu"   ( set "_AUTO=5" & set "_AUTO_LABEL=CPU only ^(driver too old - please update NVIDIA drivers^)" )
+    echo   -^> Will install PyTorch: !_AUTO_LABEL!
+)
+
+REM In AUTO_MODE: always use the detected recommendation (no prompt).
+REM In manual "setup.bat install": ask, but default to detected.
+set "TORCH_CHOICE=!_AUTO!"
+if "!AUTO_MODE!"=="0" (
+    echo.
+    echo   Manual install: you can override the detection.
+    echo   Choose PyTorch build:
+    echo     1 = NVIDIA GPU, CUDA 12.8  ^(driver ^>= 527, RTX 40/50^)
+    echo     2 = NVIDIA GPU, CUDA 11.8  ^(driver ^>= 452, older GPUs^)
+    echo     3 = NVIDIA GPU, CUDA 12.4  ^(driver ^>= 550^)
+    echo     4 = NVIDIA GPU, CUDA 12.1  ^(driver ^>= 530^)
+    echo     5 = CPU only
+    echo.
+    set /p TORCH_CHOICE="Enter 1-5 [default !_AUTO!]: "
+    if "!TORCH_CHOICE!"=="" set "TORCH_CHOICE=!_AUTO!"
 )
 echo.
-echo Choose PyTorch build:
-echo   1 = NVIDIA GPU, CUDA 12.8  ^(driver ^>= 527  e.g. RTX 40/50 series^)
-echo   2 = NVIDIA GPU, CUDA 11.8  ^(driver ^>= 452, older GTX/RTX cards^)
-echo   3 = NVIDIA GPU, CUDA 12.4  ^(driver ^>= 550^)
-echo   4 = NVIDIA GPU, CUDA 12.1  ^(driver ^>= 530^)
-echo   5 = CPU only               ^(no NVIDIA GPU, or AMD/Intel GPU^)
-echo.
-echo   Auto-detected recommendation: !_AUTO! ^(!_AUTO_LABEL!^)
-echo.
-set "TORCH_CHOICE="
-set /p TORCH_CHOICE="Enter 1-5 [default !_AUTO!]: "
-if "!TORCH_CHOICE!"=="" set "TORCH_CHOICE=!_AUTO!"
 
+echo   Installing PyTorch ^(this can take a few minutes^)...
 if "!TORCH_CHOICE!"=="1" (
-    echo.
-    echo Installing PyTorch with CUDA 12.8...
     "%VPY%" -m pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
 ) else if "!TORCH_CHOICE!"=="2" (
-    echo.
-    echo Installing PyTorch with CUDA 11.8...
     "%VPY%" -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu118
 ) else if "!TORCH_CHOICE!"=="3" (
-    echo.
-    echo Installing PyTorch with CUDA 12.4...
     "%VPY%" -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu124
 ) else if "!TORCH_CHOICE!"=="4" (
-    echo.
-    echo Installing PyTorch with CUDA 12.1...
     "%VPY%" -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu121
 ) else (
-    echo.
-    echo Installing PyTorch CPU build...
     "%VPY%" -m pip install torch==2.8.0 torchaudio==2.8.0
 )
 if errorlevel 1 (
   echo.
-  echo ERROR: PyTorch install failed. See https://pytorch.org/get-started/locally/
+  echo  ERROR: PyTorch install failed.
+  echo  Check your internet connection and try again.
+  echo  Manual reference: https://pytorch.org/get-started/locally/
   echo.
   pause
   exit /b 1
 )
-
+echo   OK: PyTorch installed.
 echo.
-echo Installing omnivoice package...
-"%VPY%" -m pip install omnivoice
+
+REM -----------------------------------------------------------------
+echo   [Step 4 of 5]  Installing OmniVoice + Flask...
+echo.
+"%VPY%" -m pip install omnivoice "flask>=3.0"
 if errorlevel 1 (
   echo.
-  pause
-  exit /b 1
-)
-
-echo.
-echo Installing Flask (Web UI^)...
-"%VPY%" -m pip install "flask>=3.0"
-if errorlevel 1 (
+  echo  ERROR: omnivoice / flask install failed.
+  echo  Check your internet connection. If error mentions "null bytes",
+  echo  delete the .venv folder and run setup.bat again.
   echo.
   pause
   exit /b 1
 )
+echo   OK: OmniVoice and Flask installed.
+echo.
+
+REM -----------------------------------------------------------------
+echo   [Step 5 of 5]  Downloading OmniVoice model weights ^(~2.5 GB^)...
+echo                  ^(saves to %%USERPROFILE%%\.cache\huggingface\hub^)
+echo                  ^(this can take 5-30 minutes on first run^)
+echo.
+call :download_weights_body
+if errorlevel 1 (
+  echo.
+  echo  WARNING: weight download had errors. The model will retry on
+  echo           the first run of run.bat — this is usually fine.
+  echo.
+)
 
 echo.
-echo ========================================
-echo  Install finished.
-echo ========================================
-echo  Double-click run.bat for the Web UI.
-echo  Repairs: double-click setup.bat ^(menu^) or run: setup.bat deeprepair
-echo  Large weights ^(model.safetensors, etc.^) are NOT on GitHub — see README.
-echo  Optional: set HF_TOKEN if Hugging Face requires it.
-echo ========================================
+echo ================================================================
+echo   All done! OmniVoice is ready to use.
+echo ================================================================
 echo.
-set "PREDL="
-set /p PREDL="Download OmniVoice weights from Hugging Face now? ~several GB [y/N]: "
-if /i "!PREDL!"=="y" (
-  call :download_weights_body
-  if errorlevel 1 echo Weight download had errors — they will retry on first run.bat
+
+if "!AUTO_MODE!"=="1" (
+    echo   Starting the Web UI now...
+    echo   ^(tip: next time just double-click run.bat^)
+    echo.
+    timeout /t 3 /nobreak >nul 2>&1
+    goto :run
 )
+
+echo   Next step: double-click run.bat to start the Web UI.
+echo   Repairs: setup.bat menu
 echo.
 pause
 exit /b 0

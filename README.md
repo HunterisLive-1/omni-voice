@@ -43,60 +43,62 @@
 
 ---
 
-## Setup & Run — Windows (One-Click)
+## Setup & Run — Windows (One-Click, Fully Automatic)
 
-### Step 1 — Download / Clone this repo
+### Step 1 — Install Python 3 (one-time)
 
-```
-git clone https://github.com/HunterIsLive/OmniVoice.git
-cd OmniVoice
-```
+Download and install from [python.org](https://www.python.org/downloads/).  
+**Important:** tick **"Add python.exe to PATH"** during install.
 
-Or download as ZIP from GitHub → Extract.
+> Alternative on Windows 11: `winget install Python.Python.3.12`
 
----
+### Step 2 — Download this repo
 
-### Step 2 — Run `setup.bat`
+- Click **Code → Download ZIP** on GitHub, or
+- `git clone https://github.com/HunterIsLive/OmniVoice.git`
 
-Double-click **`setup.bat`** in File Explorer (or run it in Command Prompt).
+Extract the ZIP and open the folder.
 
-**First time (no `.venv` yet):**
+### Step 3 — Double-click `setup.bat` — that's it!
 
-```
-setup.bat
-```
+Everything is automatic:
 
-It will:
-1. Detect your NVIDIA GPU & CUDA version automatically
-2. Ask you to confirm the PyTorch build (CUDA 12.8 / 11.8 / CPU)
-3. Create a `.venv` virtual environment
-4. Install PyTorch, OmniVoice, and Flask
-5. Optionally download model weights from Hugging Face (~2.5 GB+)
+1. Detects your Python version
+2. Creates `.venv` virtual environment
+3. Detects your GPU (NVIDIA RTX / GTX / none) and driver CUDA version
+4. Auto-picks the right PyTorch build (CUDA 12.8 / 12.4 / 12.1 / 11.8 / CPU)
+5. Installs OmniVoice + Flask
+6. Downloads model weights (~2.5 GB) from Hugging Face
+7. Launches the Web UI and opens your browser
 
-> **If `.venv` already exists**, `setup.bat` opens a repair/tools menu instead.
-
----
-
-### Step 3 — Run the Web UI
-
-Double-click **`run.bat`**  
-— or —
-
-```
-run.bat
-```
+**No prompts. No menus. No choices.** Just wait 10–30 minutes (first time only).
 
 Browser opens automatically at: **`http://127.0.0.1:8765`**
 
-> **First run:** the browser will show *"Loading OmniVoice model… first run may download weights."*  
-> This is **normal** — the model (~2.5 GB) is being downloaded from Hugging Face.  
-> Wait 5–30 minutes depending on your internet speed. Do **not** close the console window.
+---
 
-> To change the port: `set OMNIVOICE_PORT=9000` then run `run.bat`.
+### Next time — just use `run.bat`
+
+Once setup is done, you have two equivalent ways to start the Web UI:
+
+- Double-click **`run.bat`** — or —
+- Double-click **`setup.bat`** again (it detects install is complete and auto-launches)
 
 **Stop the server:** press `Ctrl+C` in the console window.
 
-**If `run.bat` shows an error and closes** — open CMD in the folder and run `setup.bat install`.
+> Change port: `set OMNIVOICE_PORT=9000` then run `run.bat`.
+
+---
+
+### Advanced — repair menu
+
+If something breaks, open Command Prompt in the folder and run:
+
+```bat
+setup.bat menu
+```
+
+This opens the repair tools menu (fix httpx, fix accelerate, deep repair, torch reinstalls, weights download, etc.).
 
 ---
 
