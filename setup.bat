@@ -7,9 +7,9 @@ set "VPY=%VENV_DIR%\Scripts\python.exe"
 set "SP=%VENV_DIR%\Lib\site-packages"
 
 REM ---------------------------------------------------------------------------
-REM  OmniVoice — one-click setup + repair (only batch file besides run.bat)
+REM  OmniVoice -- one-click setup + repair (only batch file besides run.bat)
 REM
-REM    setup.bat              FULLY AUTOMATIC — detects PC specs, installs
+REM    setup.bat              FULLY AUTOMATIC -- detects PC specs, installs
 REM                           everything, downloads weights, starts Web UI.
 REM                           Just double-click. Zero prompts.
 REM
@@ -52,7 +52,7 @@ if exist "%VENV_DIR%\Scripts\activate.bat" (
     goto :run
   )
   echo.
-  echo  .venv exists but packages are broken — reinstalling...
+  echo  .venv exists but packages are broken -- reinstalling...
   echo.
 )
 goto :install
@@ -61,7 +61,7 @@ REM ===========================================================================
 :menu
 echo.
 echo ========================================
-echo  OmniVoice — setup / repair
+echo  OmniVoice -- setup / repair
 echo ========================================
 echo  1  Full install or upgrade ^(PyTorch + omnivoice + Flask^)
 echo  2  Start Web UI ^(same as run.bat^)
@@ -200,7 +200,7 @@ exit /b 0
 REM ===========================================================================
 :need_venv
 if not exist "%VENV_DIR%\Scripts\activate.bat" (
-  echo No .venv — run setup.bat once without arguments to create it.
+  echo No .venv -- run setup.bat once without arguments to create it.
   exit /b 1
 )
 exit /b 0
@@ -272,10 +272,10 @@ if errorlevel 10 (
   echo.
   echo *** PyTorch CUDA is NOT available. If you have an NVIDIA GPU:
   echo *** Open setup.bat menu and pick the right CUDA build:
-  echo ***   driver ^>= 527  → option 8  ^(CUDA 12.8^)
-  echo ***   driver ^>= 550  → option C  ^(CUDA 12.4^)
-  echo ***   driver ^>= 530  → option B  ^(CUDA 12.1^)
-  echo ***   driver ^>= 452  → option A  ^(CUDA 11.8^)
+  echo ***   driver ^>= 527  -^> option 8  ^(CUDA 12.8^)
+  echo ***   driver ^>= 550  -^> option C  ^(CUDA 12.4^)
+  echo ***   driver ^>= 530  -^> option B  ^(CUDA 12.1^)
+  echo ***   driver ^>= 452  -^> option A  ^(CUDA 11.8^)
   echo *** Check your driver: run  nvidia-smi  and look for "CUDA Version".
   echo *** CPU-only on purpose: ignore the lines above.
   echo.
@@ -481,7 +481,7 @@ REM ===========================================================================
 cls
 echo.
 echo ================================================================
-echo   OmniVoice — Automatic installer ^(Windows^)
+echo   OmniVoice -- Automatic installer ^(Windows^)
 echo   Detecting your PC specs and installing everything...
 echo ================================================================
 echo.
@@ -668,7 +668,7 @@ call :download_weights_body
 if errorlevel 1 (
   echo.
   echo  WARNING: weight download had errors. The model will retry on
-  echo           the first run of run.bat — this is usually fine.
+  echo           the first run of run.bat -- this is usually fine.
   echo.
 )
 
