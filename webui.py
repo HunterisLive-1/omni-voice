@@ -293,26 +293,41 @@ def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path
     return float(pred_sec)
 
 
-def _audio_tensor_to_wav_bytes(tensor, sample_rate: int) -> bytes:
-    """Convert a float32 audio tensor to 16-bit PCM WAV bytes using stdlib wave.
+def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
+    """Convert a float32 audio signal to 16-bit PCM WAV bytes using stdlib wave.
 
-    Works with no external codec dependencies (no soundfile / sox / ffmpeg needed).
-    Handles tensors shaped (channels, samples) or (samples,); mixes to mono.
+    Accepts either a torch.Tensor OR a numpy.ndarray (some omnivoice versions
+    return numpy from ``model.generate``). Works with no external codec
+    dependencies. Shape can be (channels, samples) or (samples,) — mixed to mono.
     """
     import io
     import wave as _wave
-    import torch
+    import numpy as np
 
-    t = tensor.detach()
-    if t.dim() > 1:
-        t = t.mean(dim=0) if t.size(0) > 1 else t.squeeze(0)
-    pcm = (t.clamp(-1.0, 1.0) * 32767.0).to(dtype=torch.int16).cpu()
+    try:
+        import torch
+        is_torch_tensor = isinstance(audio, torch.Tensor)
+    except ImportError:
+        is_torch_tensor = False
+
+    if is_torch_tensor:
+        t = audio.detach()
+        if t.dim() > 1:
+            t = t.mean(dim=0) if t.size(0) > 1 else t.squeeze(0)
+        arr = t.clamp(-1.0, 1.0).cpu().numpy()
+    else:
+        arr = np.asarray(audio)
+        if arr.ndim > 1:
+            arr = arr.mean(axis=0) if arr.shape[0] > 1 else arr.squeeze(0)
+        arr = np.clip(arr, -1.0, 1.0)
+
+    pcm = (arr * 32767.0).astype(np.int16)
     buf = io.BytesIO()
     with _wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)  # 16-bit
         wf.setframerate(sample_rate)
-        wf.writeframes(pcm.numpy().tobytes())
+        wf.writeframes(pcm.tobytes())
     return buf.getvalue()
 
 
