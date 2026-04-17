@@ -12,3 +12,10 @@ build/
 /model.safetensors
 /audio_tokenizer/model.safetensors
 *.safetensors
+
+# Model config/tokenizer files downloaded by HuggingFace — not part of this repo
+/config.json
+/tokenizer.json
+/tokenizer_config.json
+/chat_template.jinja
+/audio_tokenizer/

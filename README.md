@@ -88,9 +88,15 @@ run.bat
 
 Browser opens automatically at: **`http://127.0.0.1:8765`**
 
-> To change the port, set environment variable: `set OMNIVOICE_PORT=9000` before running.
+> **First run:** the browser will show *"Loading OmniVoice model… first run may download weights."*  
+> This is **normal** — the model (~2.5 GB) is being downloaded from Hugging Face.  
+> Wait 5–30 minutes depending on your internet speed. Do **not** close the console window.
+
+> To change the port: `set OMNIVOICE_PORT=9000` then run `run.bat`.
 
 **Stop the server:** press `Ctrl+C` in the console window.
+
+**If `run.bat` shows an error and closes** — open CMD in the folder and run `setup.bat install`.
 
 ---
 
@@ -267,17 +273,65 @@ torchaudio.save("out_design.wav", audio[0], 24000)
 
 ## Troubleshooting
 
+### run.bat closes as soon as it opens
+
+This means either `.venv` is missing or a package failed to install.  
+**Open Command Prompt in the folder** (Shift + right-click → "Open in Terminal") and run:
+
+```bat
+setup.bat install
+```
+
+This recreates the environment. After it finishes, run `run.bat` again.
+
+> If you double-clicked `run.bat` and only saw a black window flash for a second, the new version of `run.bat` now shows a clear error message and waits — it will **not** close until you press a key.
+
+---
+
+### "Model loading" screen stays forever / model download stuck
+
+This is **normal on first run.** OmniVoice needs to download ~2.5 GB of model weights from Hugging Face. Depending on your internet speed this can take **5–30 minutes**.
+
+- The browser shows: *"Loading OmniVoice model… first run may download weights."* — **this is correct**, just wait.
+- The console window shows the download progress.
+- If it appears truly stuck after 30+ minutes, press Ctrl+C, then pre-download the weights explicitly:
+
+```bat
+setup.bat weights
+```
+
+If Hugging Face asks for authentication:
+```bat
+set HF_TOKEN=hf_your_token_here
+setup.bat weights
+```
+
+---
+
+### setup.bat closes instantly or Python not found
+
+Python 3 is not installed or not in PATH.
+
+1. Download Python from [python.org](https://www.python.org/downloads/)
+2. During install: tick **"Add python.exe to PATH"**
+3. Re-run `setup.bat`
+
+---
+
+### Common error fixes
+
 | Problem | Fix |
 |---|---|
-| `setup.bat` closes instantly | Open CMD in folder → `setup.bat install` |
-| CUDA not available after install | Run `setup.bat` → pick the right CUDA option for your driver |
+| `run.bat` closes instantly / `.venv` not found | `setup.bat install` |
+| CUDA not available after install | `setup.bat` → pick the matching CUDA option for your driver |
 | `httpx` / null bytes error | `setup.bat fixhttpx` |
-| `accelerate` error | `setup.bat fixaccelerate` |
-| Model download fails | Set `HF_TOKEN` → `setup.bat weights` |
-| Broken packages / weird errors | `setup.bat deeprepair` |
-| Still broken | Delete `.venv` folder → `setup.bat install` |
+| `accelerate` error or CPU torch replacing CUDA torch | `setup.bat fixaccelerate` |
+| Model download fails / HF auth error | Set `HF_TOKEN` → `setup.bat weights` |
+| Multiple broken packages / weird import errors | `setup.bat deeprepair` |
+| Still broken after deeprepair | Delete the `.venv` folder → `setup.bat install` |
+| Port 8765 already in use | `set OMNIVOICE_PORT=9000` → `run.bat` |
 
-Check your CUDA driver version: open CMD and run `nvidia-smi`.
+Check your CUDA driver: open CMD → `nvidia-smi` → look for `CUDA Version`.
 
 ---
 
