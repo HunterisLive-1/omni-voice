@@ -1,6 +1,7 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
+chcp 65001 >nul 2>&1
 
 REM Web UI by default. Other args go to setup.bat (e.g. run.bat verify — no second pause)
 if "%~1"=="" (

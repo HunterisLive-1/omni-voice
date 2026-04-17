@@ -4,12 +4,33 @@ OmniVoice local Web UI — opens in your browser when you run run.bat.
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import warnings
 import webbrowser
 from pathlib import Path
+
+# Suppress HF hub symlinks warning — cache still works on Windows without Developer
+# Mode, it just uses file copies instead of symlinks (slightly more disk space).
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+# Suppress the "unauthenticated requests" banner for public models.
+# Users who need a token can still set HF_TOKEN and it will be picked up automatically.
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+
+# Suppress tokenizers parallelism warning that appears on some Windows configs.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# Filter any remaining UserWarnings from huggingface_hub about symlinks / auth.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*(symlink|unauthenticated|HF_TOKEN|huggingface_hub).*",
+    category=UserWarning,
+)
 
 try:
     from flask import Flask, Response, jsonify, render_template_string, request
@@ -24,10 +45,17 @@ DEFAULT_PORT = int(os.environ.get("OMNIVOICE_PORT", "8765"))
 _app = Flask(__name__)
 _app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB uploads
 
+# Suppress werkzeug's per-request access log lines ("127.0.0.1 - - POST /generate 200").
+# Those lines corrupt the \r-based terminal progress bar during generation.
+# Startup messages ("Running on …") are printed manually in main() instead.
+import logging as _logging
+_logging.getLogger("werkzeug").setLevel(_logging.ERROR)
+
 _model = None
 _model_lock = threading.Lock()
 _load_error: str | None = None
 _load_thread: threading.Thread | None = None
+_device_info: str = "detecting…"
 
 # Speaking-style presets: OmniVoice only accepts specific instruct tokens (see README).
 # We map “narrator / storyteller / …” to those tags plus decoding options (speed, steps, chunking).
@@ -234,14 +262,21 @@ def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path
     """Align clone length with reference WAV + text ratio (fixes 6+ min bug when ref transcript is short/wrong)."""
     import torchaudio
 
+    ref_sec: float | None = None
     try:
         w, sr = torchaudio.load(ref_wav_path)
         if w.dim() > 1 and w.size(0) > 1:
             w = w.mean(dim=0, keepdim=True)
         ref_sec = w.shape[1] / float(sr)
-    except OSError:
-        return None
-    if ref_sec <= 0.05:
+    except (OSError, RuntimeError):
+        # torchaudio backend not available — fall back to stdlib wave (WAV only)
+        try:
+            import wave as _wave
+            with _wave.open(ref_wav_path, "rb") as _wf:
+                ref_sec = _wf.getnframes() / float(_wf.getframerate())
+        except Exception:
+            return None
+    if ref_sec is None or ref_sec <= 0.05:
         return None
 
     est = model.duration_estimator
@@ -258,11 +293,123 @@ def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path
     return float(pred_sec)
 
 
+def _audio_tensor_to_wav_bytes(tensor, sample_rate: int) -> bytes:
+    """Convert a float32 audio tensor to 16-bit PCM WAV bytes using stdlib wave.
+
+    Works with no external codec dependencies (no soundfile / sox / ffmpeg needed).
+    Handles tensors shaped (channels, samples) or (samples,); mixes to mono.
+    """
+    import io
+    import wave as _wave
+    import torch
+
+    t = tensor.detach()
+    if t.dim() > 1:
+        t = t.mean(dim=0) if t.size(0) > 1 else t.squeeze(0)
+    pcm = (t.clamp(-1.0, 1.0) * 32767.0).to(dtype=torch.int16).cpu()
+    buf = io.BytesIO()
+    with _wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.numpy().tobytes())
+    return buf.getvalue()
+
+
+class _GenProgress:
+    """Live terminal progress bar while model.generate() runs.
+
+    Usage::
+        with _GenProgress("Voice Clone", est_sec=14.0):
+            audio = model.generate(...)
+    """
+
+    _SPIN = ["|", "/", "-", "\\"]
+    _BAR_W = 22
+
+    def __init__(self, mode: str, est_sec: float | None = None):
+        self._mode = mode
+        self._est = est_sec
+        self._t0 = 0.0
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def __enter__(self):
+        self._t0 = time.time()
+        est_str = f"  (est. ~{self._est:.0f}s)" if self._est else ""
+        print(f"[OmniVoice] Generating {self._mode}…{est_str}", flush=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, *_):
+        self._done.set()
+        self._thread.join(timeout=2.0)
+        elapsed = time.time() - self._t0
+        label = "done" if exc_type is None else "FAILED"
+        # Overwrite the last spinner line with the final result
+        print(
+            f"\r[OmniVoice] {self._mode} {label} in {elapsed:.1f}s" + " " * 30,
+            flush=True,
+        )
+
+    def _loop(self):
+        idx = 0
+        while not self._done.wait(0.3):
+            elapsed = time.time() - self._t0
+            spin = self._SPIN[idx % len(self._SPIN)]
+            if self._est and self._est > 1.0:
+                frac = min(elapsed / self._est, 0.99)
+                filled = int(frac * self._BAR_W)
+                bar = "#" * filled + "." * (self._BAR_W - filled)
+                pct = int(frac * 100)
+                line = (
+                    f"\r[OmniVoice] {spin} [{bar}] {pct:2d}%  {elapsed:5.1f}s"
+                )
+            else:
+                line = f"\r[OmniVoice] {spin} {elapsed:5.1f}s"
+            print(line, end="", flush=True)
+            idx += 1
+
+
 def _get_device_dtype():
+    global _device_info
     import torch
 
     if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        cuda_ver = torch.version.cuda or "unknown"
+        _device_info = f"GPU: {gpu_name} | CUDA {cuda_ver}"
+        print(f"[OmniVoice] {_device_info}", flush=True)
         return "cuda:0", torch.float16
+
+    # NVIDIA GPU detected by nvidia-smi but CUDA not usable — give actionable hint
+    try:
+        r = subprocess.run(
+            ["nvidia-smi"], capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            m = re.search(r"CUDA Version: (\d+\.\d+)", r.stdout)
+            drv_cuda = m.group(1) if m else "unknown"
+            _device_info = f"CPU (NVIDIA driver CUDA {drv_cuda} found but torch CUDA unavailable)"
+            print(
+                f"\n[OmniVoice] WARNING: NVIDIA GPU found (driver supports CUDA {drv_cuda})"
+                f" but torch.cuda.is_available() = False.\n"
+                f"  PyTorch was likely installed without CUDA support.\n"
+                f"  Fix: open setup.bat and pick the matching CUDA build:\n"
+                f"    driver CUDA >= 12.8  →  option 8 (CUDA 12.8)\n"
+                f"    driver CUDA >= 12.4  →  option C (CUDA 12.4)\n"
+                f"    driver CUDA >= 12.1  →  option B (CUDA 12.1)\n"
+                f"    driver CUDA >= 11.8  →  option A (CUDA 11.8)\n"
+                f"  Check your driver:  run  nvidia-smi  and look for 'CUDA Version'.\n",
+                flush=True,
+            )
+        else:
+            _device_info = "CPU (no NVIDIA GPU detected)"
+            print("[OmniVoice] Running on CPU — no NVIDIA GPU detected.", flush=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        _device_info = "CPU"
+        print("[OmniVoice] Running on CPU.", flush=True)
+
     return "cpu", torch.float32
 
 
@@ -517,8 +664,12 @@ PAGE_HTML = """<!DOCTYPE html>
     {% elif not model_ready %}
     <div class="card" id="loader-card">
       <p class="status" id="loader-msg">Loading OmniVoice model… first run may download weights. This can take several minutes.</p>
+      <p class="hint" id="device-hint">Device: <span id="device-label">{{ device_info }}</span></p>
       <p class="hint">You can subscribe on YouTube while you wait — link above.</p>
     </div>
+    {% endif %}
+    {% if model_ready and not load_error %}
+    <p class="hint" style="text-align:center;margin-bottom:0.5rem">Device: {{ device_info }}</p>
     {% endif %}
 
     <div class="card" id="main-card" {% if not model_ready or load_error %}style="display:none"{% endif %}>
@@ -651,6 +802,8 @@ PAGE_HTML = """<!DOCTYPE html>
           location.reload();
           return;
         }
+        const lbl = document.getElementById("device-label");
+        if (lbl && j.device) lbl.textContent = j.device;
         if (j.ready) {
           loaderCard.style.display = "none";
           mainCard.style.display = "block";
@@ -697,6 +850,7 @@ def _render_ui(page: str):
         yt_url=YOUTUBE_CHANNEL_URL,
         load_error=_load_error,
         model_ready=_model is not None,
+        device_info=_device_info,
         speaking_keys=SPEAKING_STYLE_ORDER,
         quality_keys=QUALITY_ORDER,
         speaking_presets=SPEAKING_STYLE_PRESETS,
@@ -722,6 +876,7 @@ def api_status():
     return jsonify(
         ready=_model is not None,
         error=bool(_load_error),
+        device=_device_info,
     )
 
 
@@ -767,8 +922,6 @@ def generate():
     if suffix not in (".wav", ".wave"):
         return Response("Please upload a WAV file.", status=400, mimetype="text/plain")
 
-    import torchaudio
-
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp_path = tmp.name
     tmp.close()
@@ -797,27 +950,19 @@ def generate():
         elif speed is not None:
             call_kw["speed"] = speed
 
+        preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
+        print(f'[OmniVoice] Text: "{preview}"', flush=True)
         try:
-            with _model_lock:
-                audio = _model.generate(**call_kw)
+            with _GenProgress("Voice Clone", est_sec=dur):
+                with _model_lock:
+                    audio = _model.generate(**call_kw)
         except ValueError as e:
             return Response(
                 "Invalid style for this mode:\n" + str(e),
                 status=400,
                 mimetype="text/plain",
             )
-        out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        out_path = out_tmp.name
-        out_tmp.close()
-        try:
-            torchaudio.save(out_path, audio[0], 24000)
-            with open(out_path, "rb") as wf:
-                wav_bytes = wf.read()
-        finally:
-            try:
-                os.unlink(out_path)
-            except OSError:
-                pass
+        wav_bytes = _audio_tensor_to_wav_bytes(audio[0], 24000)
         return Response(
             wav_bytes,
             mimetype="audio/wav",
@@ -876,30 +1021,20 @@ def generate_design():
     if speed is not None:
         call_kw["speed"] = speed
 
-    import torchaudio
-
+    preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
+    print(f'[OmniVoice] Text: "{preview}"', flush=True)
     try:
         try:
-            with _model_lock:
-                audio = _model.generate(**call_kw)
+            with _GenProgress("Voice Design"):
+                with _model_lock:
+                    audio = _model.generate(**call_kw)
         except ValueError as e:
             return Response(
                 "Invalid voice style tags:\n" + str(e),
                 status=400,
                 mimetype="text/plain",
             )
-        out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        out_path = out_tmp.name
-        out_tmp.close()
-        try:
-            torchaudio.save(out_path, audio[0], 24000)
-            with open(out_path, "rb") as wf:
-                wav_bytes = wf.read()
-        finally:
-            try:
-                os.unlink(out_path)
-            except OSError:
-                pass
+        wav_bytes = _audio_tensor_to_wav_bytes(audio[0], 24000)
         return Response(
             wav_bytes,
             mimetype="audio/wav",
