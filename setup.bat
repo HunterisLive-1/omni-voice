@@ -219,21 +219,32 @@ if errorlevel 1 (
 echo  OK: Git is ready.
 exit /b 0
 
-REM Try to install Git during full setup; do not abort installer if Git fails
+REM Try to install Git during full setup — NEVER abort the installer ^(winget quirks / PATH^)
 :ensure_git_for_install
 where git >nul 2>&1
 if not errorlevel 1 (
   echo   OK: Git found ^(you can use menu U to pull updates^).
   exit /b 0
 )
-echo   Git not in PATH — attempting install via winget ^(optional, for GitHub updates^)...
-call :ensure_git
+echo   Git not in PATH — optional winget install ^(for menu U / setup.bat update^)...
+where winget >nul 2>&1
 if errorlevel 1 (
-  echo   ^(Optional^) Git will stay missing until you install it — setup continues.
-  echo   Updates:  setup.bat menu ^> U  will install Git if possible ^(ZIP or clone^).
-) else (
-  echo   OK: Git installed — use menu U or  setup.bat update  to pull latest from GitHub.
+  echo   winget not available — skipping Git. Install later: https://git-scm.com/download/win
+  echo   Setup continues with Python / PyTorch...
+  exit /b 0
 )
+echo   Running winget for Git.Git ^(separate process — window should stay open^)...
+REM Isolate winget so it cannot terminate this setup.bat on some Windows builds
+cmd /c winget install --id Git.Git -e --source winget --accept-package-agreements --accept-source-agreements
+set "PATH=%PATH%;C:\Program Files\Git\cmd;C:\Program Files\Git\bin;%LocalAppData%\Programs\Git\cmd;%ProgramFiles(x86)%\Git\cmd"
+where git >nul 2>&1
+if not errorlevel 1 (
+  echo   OK: Git is on PATH now.
+) else (
+  echo   Git not on PATH yet ^(common after first winget install^).
+  echo   Close this window, open a NEW Command Prompt here, run setup.bat again — or install Git from git-scm.com
+)
+echo   Continuing OmniVoice setup...
 exit /b 0
 
 :update_repo_body
@@ -803,8 +814,12 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-for /f "delims=" %%V in ('%PYEXE% -c "import sys;print(sys.version.split()[0])"') do set "_PYV=%%V"
-echo   OK: Python %_PYV% found.
+REM Avoid for /f + "py -3" quoting issues that can crash the script on some PCs
+%PYEXE% -c "import sys;print(sys.version.split()[0])" >"%TEMP%\ov_pyver.tmp" 2>nul
+set "_PYV=unknown"
+if exist "%TEMP%\ov_pyver.tmp" set /p _PYV=<"%TEMP%\ov_pyver.tmp"
+del "%TEMP%\ov_pyver.tmp" >nul 2>&1
+echo   OK: Python !_PYV! found.
 echo.
 
 REM -----------------------------------------------------------------
@@ -1012,4 +1027,10 @@ echo.
 
 "%VPY%" -u "%~dp0webui.py"
 set "ERR=!ERRORLEVEL!"
+if not "!ERR!"=="0" (
+  echo.
+  echo  Web UI exited with code !ERR!. Read errors above.
+  echo  Repair: setup.bat menu   or   setup.bat install
+  pause
+)
 exit /b !ERR!
