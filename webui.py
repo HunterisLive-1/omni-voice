@@ -48,6 +48,7 @@ REF_TRIM_THRESHOLD_SEC = 10.0
 REF_TARGET_MAX_SEC = 8.0
 REF_MIN_WARN_SEC = 3.0
 DESIGN_LOCK_WAV = WEBUI_DATA_DIR / "design_voice_lock.wav"
+WHISPER_MODEL_FILE = WEBUI_DATA_DIR / "whisper_model.txt"
 
 _app = Flask(__name__)
 _app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB uploads
@@ -318,6 +319,31 @@ def _sha256_file(path: str) -> str:
         for block in iter(lambda: f.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _whisper_model_name() -> str:
+    """HF model id for reference auto-transcribe (multilingual Whisper; supports Hindi)."""
+    if WHISPER_MODEL_FILE.is_file():
+        try:
+            for line in WHISPER_MODEL_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+        except OSError:
+            pass
+    env = (os.environ.get("OMNIVOICE_WHISPER_MODEL") or "").strip()
+    if env:
+        return env
+    return "openai/whisper-large-v3-turbo"
+
+
+def _ensure_whisper_pipeline(model) -> None:
+    """Load Whisper ASR once; uses ``webui_data/whisper_model.txt`` or ``OMNIVOICE_WHISPER_MODEL``."""
+    if getattr(model, "_asr_pipe", None) is not None:
+        return
+    mid = _whisper_model_name()
+    print(f"[OmniVoice] Loading Whisper ASR: {mid}", flush=True)
+    model.load_asr_model(model_name=mid)
 
 
 def _preprocess_reference_wav(
@@ -1089,6 +1115,7 @@ def generate():
             ref_for_dur = cached_tr
         elif auto_transcribe:
             with _model_lock:
+                _ensure_whisper_pipeline(_model)
                 vcp = _model.create_voice_clone_prompt(
                     ref_audio=tmp_proc_path,
                     ref_text=None,
@@ -1220,6 +1247,7 @@ def generate_design():
                 ref_for_dur = cached_tr
             else:
                 with _model_lock:
+                    _ensure_whisper_pipeline(_model)
                     vcp = _model.create_voice_clone_prompt(
                         ref_audio=tmp_proc_path,
                         ref_text=None,
