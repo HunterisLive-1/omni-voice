@@ -42,6 +42,13 @@ YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@HunterIsLive-18"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = int(os.environ.get("OMNIVOICE_PORT", "8765"))
 
+# Local data: reference transcript cache (SHA256 → text) and optional design voice lock WAV.
+WEBUI_DATA_DIR = Path(__file__).resolve().parent / "webui_data"
+REF_TRIM_THRESHOLD_SEC = 10.0
+REF_TARGET_MAX_SEC = 8.0
+REF_MIN_WARN_SEC = 3.0
+DESIGN_LOCK_WAV = WEBUI_DATA_DIR / "design_voice_lock.wav"
+
 _app = Flask(__name__)
 _app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB uploads
 
@@ -256,6 +263,93 @@ def _design_voice_speed_override(voice_profile_raw: str | None) -> float | None:
     )
     sp = DESIGN_VOICE_PROFILES[vp_key].get("speed")
     return float(sp) if isinstance(sp, int | float) else None
+
+
+def _form_checkbox_on(raw: str | None) -> bool:
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "on", "true", "yes")
+
+
+def _normalize_chunking_text(text: str) -> str:
+    """Map Hindi/Sanskrit danda to a period so ``chunk_text_punctuation`` can split."""
+    if not text:
+        return text
+    t = text.replace("\u0965", ". ")  # ॥
+    t = t.replace("\u0964", ". ")  # ।
+    return t
+
+
+def _is_hindi_language_hint(language: str | None) -> bool:
+    if not language:
+        return False
+    s = language.strip().lower()
+    return "hindi" in s or s in ("hi", "hin")
+
+
+def _ref_cache_path(content_hash: str) -> Path:
+    d = WEBUI_DATA_DIR / "ref_transcript_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{content_hash}.txt"
+
+
+def _ref_cache_read(content_hash: str) -> str | None:
+    p = _ref_cache_path(content_hash)
+    if not p.is_file():
+        return None
+    try:
+        return p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _ref_cache_write(content_hash: str, transcript: str) -> None:
+    try:
+        _ref_cache_path(content_hash).write_text(transcript.strip(), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _sha256_file(path: str) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _preprocess_reference_wav(
+    in_path: str, out_path: str, target_sr: int
+) -> tuple[list[str], float]:
+    """Mono, resample, trim clips longer than ~10s. Returns (warnings, duration sec)."""
+    import torchaudio
+    from omnivoice.utils.audio import trim_long_audio
+
+    warnings: list[str] = []
+    w, sr = torchaudio.load(in_path)
+    if w.dim() == 1:
+        w = w.unsqueeze(0)
+    if w.size(0) > 1:
+        w = w.mean(dim=0, keepdim=True)
+    if sr != target_sr:
+        w = torchaudio.functional.resample(w, sr, target_sr)
+    dur = w.shape[1] / float(target_sr)
+    if dur < REF_MIN_WARN_SEC:
+        warnings.append(
+            f"Reference audio is only {dur:.1f}s; 3–10s of clear speech is recommended."
+        )
+    w = trim_long_audio(
+        w,
+        target_sr,
+        max_duration=REF_TARGET_MAX_SEC,
+        min_duration=2.0,
+        trim_threshold=REF_TRIM_THRESHOLD_SEC,
+    )
+    torchaudio.save(out_path, w, target_sr)
+    new_dur = w.shape[1] / float(target_sr)
+    return warnings, new_dur
 
 
 def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path: str) -> float | None:
@@ -696,9 +790,13 @@ PAGE_HTML = """<!DOCTYPE html>
           <p class="hint">Use a clear recording; match the transcription below.</p>
         </div>
         <div class="row">
-          <label for="ref_text">Reference transcription</label>
+          <label><input type="checkbox" name="auto_transcribe_ref" value="1" checked /> Auto-transcribe reference (Whisper — recommended)</label>
+          <p class="hint">Runs ASR on your WAV (cached by clip hash) so reference text matches the audio. Paste a manual transcript below to skip ASR. First ASR run may download Whisper.</p>
+        </div>
+        <div class="row">
+          <label for="ref_text">Reference transcription (optional if auto-transcribe is on)</label>
           <input id="ref_text" name="ref_text" type="text"
-            placeholder="Exact words spoken in the WAV — wrong or very short text here makes output too long and messy" />
+            placeholder="Exact words in the WAV — leave empty when using auto-transcribe" />
         </div>
         <div class="row">
           <label for="voice_gender_clone">Voice gender</label>
@@ -787,7 +885,15 @@ PAGE_HTML = """<!DOCTYPE html>
         <div class="row">
           <label for="language">Language (optional)</label>
           <input id="language" name="language" type="text" placeholder="English, Hindi, en, hi — or leave empty" />
-          <p class="hint">Helps quality when set; empty uses language-agnostic mode.</p>
+          <p class="hint">Helps quality when set; empty uses language-agnostic mode. Hindi uses slightly slower pacing when detected.</p>
+        </div>
+        <div class="row">
+          <label><input type="checkbox" name="use_design_voice_lock" value="1" /> Use saved design voice (consistent timbre)</label>
+          <p class="hint">Reuses the WAV you saved below as reference audio — same character across sessions, like locking a designed voice.</p>
+        </div>
+        <div class="row">
+          <label><input type="checkbox" name="save_design_voice_lock" value="1" /> After this run, save output as my design voice</label>
+          <p class="hint">Generate once with the voice you like, check this, then later enable &quot;Use saved design voice&quot; for consistency.</p>
         </div>
         <button type="submit" id="submit-btn" {% if load_error or not model_ready %}disabled{% endif %}>Generate speech</button>
         <p class="hint">No WAV upload needed — describes the voice in text instead of cloning a sample.</p>
@@ -845,7 +951,10 @@ PAGE_HTML = """<!DOCTYPE html>
         }
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
-        result.innerHTML = "<p class=\\"status\\">Done — play or save below.</p><audio controls src=\\"" + url + "\\"></audio>";
+        const w = res.headers.get("X-OmniVoice-Warn");
+        let extra = "";
+        if (w) extra = "<p class=\\"hint\\"><strong>Note:</strong> " + w.replace(/</g, "&lt;") + "</p>";
+        result.innerHTML = "<p class=\\"status\\">Done — play or save below.</p>" + extra + "<audio controls src=\\"" + url + "\\"></audio>";
       } catch (err) {
         result.innerHTML = "<div class=\\"err\\">" + err.message + "</div>";
       }
@@ -921,14 +1030,14 @@ def generate():
     if not ref_file or not ref_file.filename:
         return Response("Missing reference audio file.", status=400, mimetype="text/plain")
 
-    text = (request.form.get("text") or "").strip()
+    text = _normalize_chunking_text((request.form.get("text") or "").strip())
     ref_text = (request.form.get("ref_text") or "").strip()
+    auto_transcribe = _form_checkbox_on(request.form.get("auto_transcribe_ref"))
     if not text:
         return Response("Missing text to speak.", status=400, mimetype="text/plain")
-    if not ref_text:
+    if not auto_transcribe and not ref_text:
         return Response(
-            "Reference transcription is required — type the exact words spoken in the WAV. "
-            "Wrong or missing text makes cloning much longer and worse.",
+            "Either enable auto-transcribe or paste the exact words spoken in the WAV.",
             status=400,
             mimetype="text/plain",
         )
@@ -937,9 +1046,12 @@ def generate():
     if suffix not in (".wav", ".wave"):
         return Response("Please upload a WAV file.", status=400, mimetype="text/plain")
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp_path = tmp.name
-    tmp.close()
+    tmp_raw = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_raw_path = tmp_raw.name
+    tmp_raw.close()
+    tmp_proc = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp_proc_path = tmp_proc.name
+    tmp_proc.close()
     gen_kw, speed = _resolve_style_and_quality(
         request.form.get("speaking_style"),
         request.form.get("quality_preset"),
@@ -948,27 +1060,63 @@ def generate():
         request.form.get("speaking_style"),
         request.form.get("voice_gender"),
     )
+    warn_hdr: list[str] = []
 
     try:
-        ref_file.save(tmp_path)
-        call_kw: dict = {
-            "text": text,
-            "ref_audio": tmp_path,
-            "ref_text": ref_text,
-            **gen_kw,
-        }
+        ref_file.save(tmp_raw_path)
+        sr = int(getattr(_model, "sampling_rate", None) or 24000)
+        pre_warnings, _dur = _preprocess_reference_wav(tmp_raw_path, tmp_proc_path, sr)
+        warn_hdr.extend(pre_warnings)
+
+        content_hash = _sha256_file(tmp_proc_path)
+        cached_tr = _ref_cache_read(content_hash) if auto_transcribe else None
+
+        call_kw: dict = {**gen_kw, "text": text}
         if clone_instruct:
             call_kw["instruct"] = clone_instruct
-        dur = _clone_target_duration_seconds(_model, ref_text, text, tmp_path)
-        if dur is not None:
-            call_kw["duration"] = dur
+
+        ref_for_dur: str | None = None
+        est_sec: float | None = None
+
+        if auto_transcribe and ref_text:
+            # Expert override: skip ASR but keep preprocessing/trim.
+            call_kw["ref_audio"] = tmp_proc_path
+            call_kw["ref_text"] = ref_text
+            ref_for_dur = ref_text
+        elif auto_transcribe and cached_tr:
+            call_kw["ref_audio"] = tmp_proc_path
+            call_kw["ref_text"] = cached_tr
+            ref_for_dur = cached_tr
+        elif auto_transcribe:
+            with _model_lock:
+                vcp = _model.create_voice_clone_prompt(
+                    ref_audio=tmp_proc_path,
+                    ref_text=None,
+                    preprocess_prompt=True,
+                )
+            _ref_cache_write(content_hash, vcp.ref_text)
+            call_kw["voice_clone_prompt"] = vcp
+            ref_for_dur = vcp.ref_text
+        else:
+            call_kw["ref_audio"] = tmp_proc_path
+            call_kw["ref_text"] = ref_text
+            ref_for_dur = ref_text
+
+        if ref_for_dur:
+            est_sec = _clone_target_duration_seconds(
+                _model, ref_for_dur, text, tmp_proc_path
+            )
+            if est_sec is not None:
+                call_kw["duration"] = est_sec
+            elif speed is not None:
+                call_kw["speed"] = speed
         elif speed is not None:
             call_kw["speed"] = speed
 
         preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
         print(f'[OmniVoice] Text: "{preview}"', flush=True)
         try:
-            with _GenProgress("Voice Clone", est_sec=dur):
+            with _GenProgress("Voice Clone", est_sec=est_sec):
                 with _model_lock:
                     audio = _model.generate(**call_kw)
         except ValueError as e:
@@ -977,24 +1125,26 @@ def generate():
                 status=400,
                 mimetype="text/plain",
             )
-        wav_bytes = _audio_tensor_to_wav_bytes(audio[0], 24000)
-        return Response(
-            wav_bytes,
-            mimetype="audio/wav",
-            headers={"Content-Disposition": "inline; filename=omnivoice_out.wav"},
-        )
+        wav_bytes = _audio_tensor_to_wav_bytes(audio[0], sr)
+        headers = {
+            "Content-Disposition": "inline; filename=omnivoice_out.wav",
+        }
+        if warn_hdr:
+            headers["X-OmniVoice-Warn"] = " ".join(warn_hdr)[:900]
+        return Response(wav_bytes, mimetype="audio/wav", headers=headers)
     except Exception as e:  # noqa: BLE001
         return Response(str(e), status=500, mimetype="text/plain")
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        for p in (tmp_raw_path, tmp_proc_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
 
 @_app.route("/generate-design", methods=["POST"])
 def generate_design():
-    """Voice design / auto voice: no reference audio (OmniVoice ``instruct`` mode)."""
+    """Voice design, optional Hindi pacing, optional locked reference (saved WAV)."""
     _ensure_load_started()
     if _load_error:
         return Response(_load_error, status=503, mimetype="text/plain")
@@ -1005,9 +1155,19 @@ def generate_design():
             mimetype="text/plain",
         )
 
-    text = (request.form.get("text") or "").strip()
+    text = _normalize_chunking_text((request.form.get("text") or "").strip())
     if not text:
         return Response("Missing text to speak.", status=400, mimetype="text/plain")
+
+    use_lock = _form_checkbox_on(request.form.get("use_design_voice_lock"))
+    save_lock = _form_checkbox_on(request.form.get("save_design_voice_lock"))
+    if use_lock and not DESIGN_LOCK_WAV.is_file():
+        return Response(
+            "No saved design voice found. Generate once with “Save output as my design voice” checked, "
+            "then enable “Use saved design voice”.",
+            status=400,
+            mimetype="text/plain",
+        )
 
     instruct_combined = _instruct_for_design(
         request.form.get("speaking_style"),
@@ -1027,20 +1187,72 @@ def generate_design():
     )
     speed_prof = _design_voice_speed_override(request.form.get("design_voice"))
     speed = speed_prof if speed_prof is not None else speed_style
+    if _is_hindi_language_hint(language):
+        speed = float(speed) * 0.88 if speed is not None else 0.88
 
-    call_kw: dict = {"text": text, **gen_kw}
-    if instruct_combined:
-        call_kw["instruct"] = instruct_combined
-    if language:
-        call_kw["language"] = language
-    if speed is not None:
-        call_kw["speed"] = speed
+    sr = int(getattr(_model, "sampling_rate", None) or 24000)
+    warn_hdr: list[str] = []
+    tmp_proc_path: str | None = None
+    est_sec: float | None = None
 
-    preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
-    print(f'[OmniVoice] Text: "{preview}"', flush=True)
     try:
+        if use_lock:
+            tmp_proc = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            tmp_proc_path = tmp_proc.name
+            tmp_proc.close()
+            pre_warnings, _ = _preprocess_reference_wav(
+                str(DESIGN_LOCK_WAV.resolve()), tmp_proc_path, sr
+            )
+            warn_hdr.extend(pre_warnings)
+            content_hash = _sha256_file(tmp_proc_path)
+            cached_tr = _ref_cache_read(content_hash)
+
+            call_kw: dict = {**gen_kw, "text": text}
+            if instruct_combined:
+                call_kw["instruct"] = instruct_combined
+            if language:
+                call_kw["language"] = language
+
+            ref_for_dur: str | None = None
+            if cached_tr:
+                call_kw["ref_audio"] = tmp_proc_path
+                call_kw["ref_text"] = cached_tr
+                ref_for_dur = cached_tr
+            else:
+                with _model_lock:
+                    vcp = _model.create_voice_clone_prompt(
+                        ref_audio=tmp_proc_path,
+                        ref_text=None,
+                        preprocess_prompt=True,
+                    )
+                _ref_cache_write(content_hash, vcp.ref_text)
+                call_kw["voice_clone_prompt"] = vcp
+                ref_for_dur = vcp.ref_text
+
+            if ref_for_dur:
+                est_sec = _clone_target_duration_seconds(
+                    _model, ref_for_dur, text, tmp_proc_path
+                )
+                if est_sec is not None:
+                    call_kw["duration"] = est_sec
+                elif speed is not None:
+                    call_kw["speed"] = speed
+            elif speed is not None:
+                call_kw["speed"] = speed
+        else:
+            call_kw = {"text": text, **gen_kw}
+            if instruct_combined:
+                call_kw["instruct"] = instruct_combined
+            if language:
+                call_kw["language"] = language
+            if speed is not None:
+                call_kw["speed"] = speed
+
+        preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
+        print(f'[OmniVoice] Text: "{preview}"', flush=True)
+        label = "Voice Design (locked ref)" if use_lock else "Voice Design"
         try:
-            with _GenProgress("Voice Design"):
+            with _GenProgress(label, est_sec=est_sec):
                 with _model_lock:
                     audio = _model.generate(**call_kw)
         except ValueError as e:
@@ -1049,14 +1261,27 @@ def generate_design():
                 status=400,
                 mimetype="text/plain",
             )
-        wav_bytes = _audio_tensor_to_wav_bytes(audio[0], 24000)
-        return Response(
-            wav_bytes,
-            mimetype="audio/wav",
-            headers={"Content-Disposition": "inline; filename=omnivoice_design.wav"},
-        )
+        wav_bytes = _audio_tensor_to_wav_bytes(audio[0], sr)
+        if save_lock:
+            try:
+                WEBUI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                DESIGN_LOCK_WAV.write_bytes(wav_bytes)
+                print(f"[OmniVoice] Saved design voice lock to {DESIGN_LOCK_WAV}", flush=True)
+            except OSError as ose:
+                warn_hdr.append(f"Could not save design voice lock: {ose}")
+
+        headers = {"Content-Disposition": "inline; filename=omnivoice_design.wav"}
+        if warn_hdr:
+            headers["X-OmniVoice-Warn"] = " ".join(warn_hdr)[:900]
+        return Response(wav_bytes, mimetype="audio/wav", headers=headers)
     except Exception as e:  # noqa: BLE001
         return Response(str(e), status=500, mimetype="text/plain")
+    finally:
+        if tmp_proc_path:
+            try:
+                os.unlink(tmp_proc_path)
+            except OSError:
+                pass
 
 
 def _open_browser_later():

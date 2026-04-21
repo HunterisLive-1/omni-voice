@@ -1,5 +1,8 @@
 .venv/
 __pycache__/
+
+# Web UI: cached reference transcripts + optional saved design voice lock
+/webui_data/
 *.py[cod]
 *.wav
 .env
