@@ -1,4 +1,14 @@
 @echo off
+REM Double-click (no arguments): run the rest in a child cmd so the window stays open for errors.
+if "%~1"=="" (
+  "%ComSpec%" /d /s /c call "%~f0" _OV_CHILD_
+  echo.
+  echo  Press any key to close this window...
+  pause >nul
+  exit /b 0
+)
+if /i "%~1"=="_OV_CHILD_" shift
+
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
@@ -22,7 +32,7 @@ REM    setup.bat weights      Pre-download Hugging Face model files
 REM    setup.bat whisper      Whisper ASR menu ^(model for Hindi / auto-transcribe^)
 REM    setup.bat whisperinstall   pip install ASR helpers ^(soundfile, hub^)
 REM    setup.bat whisperdownload  Pre-download selected Whisper weights
-REM    setup.bat update       Pull latest from GitHub ^(clone or ZIP — auto git init + origin^)
+REM    setup.bat update       Pull latest from GitHub ^(clone or ZIP - auto git init + origin^)
 REM ---------------------------------------------------------------------------
 
 set "AUTO_MODE=0"
@@ -84,8 +94,8 @@ echo  A  Reinstall PyTorch CUDA 11.8  ^(driver ^>= 452, older GTX/RTX cards^)
 echo  B  Reinstall PyTorch CUDA 12.1  ^(driver ^>= 530^)
 echo  C  Reinstall PyTorch CUDA 12.4  ^(driver ^>= 550, RTX 30/40 series^)
 echo  D  Download / update model weights from Hugging Face ^(large download^)
-echo  E  Whisper ASR ^(auto-transcribe ref WAV^) — model, install, Hindi-friendly presets
-echo  U  Update project from GitHub ^(git pull — ZIP gets auto-linked on first run^)
+echo  E  Whisper ASR ^(auto-transcribe ref WAV^) - model, install, Hindi-friendly presets
+echo  U  Update project from GitHub ^(git pull - ZIP gets auto-linked on first run^)
 echo  0  Exit
 echo ========================================
 set "CH="
@@ -219,21 +229,21 @@ if errorlevel 1 (
 echo  OK: Git is ready.
 exit /b 0
 
-REM Try to install Git during full setup — NEVER abort the installer ^(winget quirks / PATH^)
+REM Try to install Git during full setup  - NEVER abort the installer ^(winget quirks / PATH^)
 :ensure_git_for_install
 where git >nul 2>&1
 if not errorlevel 1 (
   echo   OK: Git found ^(you can use menu U to pull updates^).
   exit /b 0
 )
-echo   Git not in PATH — optional winget install ^(for menu U / setup.bat update^)...
+echo   Git not in PATH  - optional winget install ^(for menu U / setup.bat update^)...
 where winget >nul 2>&1
 if errorlevel 1 (
-  echo   winget not available — skipping Git. Install later: https://git-scm.com/download/win
+  echo   winget not available  - skipping Git. Install later: https://git-scm.com/download/win
   echo   Setup continues with Python / PyTorch...
   exit /b 0
 )
-echo   Running winget for Git.Git ^(separate process — window should stay open^)...
+echo   Running winget for Git.Git ^(separate process  - window should stay open^)...
 REM Isolate winget so it cannot terminate this setup.bat on some Windows builds
 cmd /c winget install --id Git.Git -e --source winget --accept-package-agreements --accept-source-agreements
 set "PATH=%PATH%;C:\Program Files\Git\cmd;C:\Program Files\Git\bin;%LocalAppData%\Programs\Git\cmd;%ProgramFiles(x86)%\Git\cmd"
@@ -242,7 +252,7 @@ if not errorlevel 1 (
   echo   OK: Git is on PATH now.
 ) else (
   echo   Git not on PATH yet ^(common after first winget install^).
-  echo   Close this window, open a NEW Command Prompt here, run setup.bat again — or install Git from git-scm.com
+  echo   Close this window, open a NEW Command Prompt here, run setup.bat again  - or install Git from git-scm.com
 )
 echo   Continuing OmniVoice setup...
 exit /b 0
@@ -329,7 +339,7 @@ if exist "%VENV_DIR%\Scripts\activate.bat" (
   echo  Refreshing pip packages ^(omnivoice, flask^)...
   call "%VENV_DIR%\Scripts\activate.bat"
   python -m pip install --upgrade omnivoice "flask>=3.0"
-  if errorlevel 1 echo  pip upgrade had warnings — run  setup.bat install  if imports break.
+  if errorlevel 1 echo  pip upgrade had warnings  - run  setup.bat install  if imports break.
 )
 exit /b 0
 
@@ -350,19 +360,19 @@ goto :whisper_menu
 cls
 echo.
 echo ========================================
-echo  Whisper ASR — Web UI reference auto-transcribe
+echo  Whisper ASR  - Web UI reference auto-transcribe
 echo ========================================
 echo  All OpenAI Whisper checkpoints on Hugging Face are multilingual ^(Hindi + 90+ langs^).
 echo  Config file: %~dp0webui_data\whisper_model.txt
 echo  Env override ^(optional^): OMNIVOICE_WHISPER_MODEL
 echo  After changing model: restart run.bat
 echo.
-echo  1  Recommended: openai/whisper-large-v3-turbo ^(default — fast, good Hindi^)
+echo  1  Recommended: openai/whisper-large-v3-turbo ^(default  - fast, good Hindi^)
 echo  2  Higher quality: openai/whisper-large-v3 ^(slower, heavier VRAM^)
 echo  3  Balanced: openai/whisper-medium
 echo  4  Lighter GPU / less RAM: openai/whisper-small
 echo  5  CPU or very low VRAM: openai/whisper-base
-echo  6  Custom — type any Hugging Face model id
+echo  6  Custom  - type any Hugging Face model id
 echo  7  Pre-download current model ^(saves time on first Web UI use^)
 echo  8  Show current model id
 echo  9  Install / upgrade ASR pip packages ^(soundfile, huggingface_hub, transformers^)
