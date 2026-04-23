@@ -33,6 +33,8 @@ REM    setup.bat whisper      Whisper ASR menu ^(model for Hindi / auto-transcri
 REM    setup.bat whisperinstall   pip install ASR helpers ^(soundfile, hub^)
 REM    setup.bat whisperdownload  Pre-download selected Whisper weights
 REM    setup.bat update       Pull latest from GitHub ^(clone or ZIP - auto git init + origin^)
+REM
+REM  Non-tech users: double-click  update.bat  in this folder  -- same as setup.bat update
 REM ---------------------------------------------------------------------------
 
 set "AUTO_MODE=0"
@@ -336,9 +338,13 @@ echo  Project files updated.
 
 :update_repo_pip
 if exist "%VENV_DIR%\Scripts\activate.bat" (
-  echo  Refreshing pip packages ^(omnivoice, flask^)...
+  echo  Refreshing pip packages from requirements ^(omnivoice, flask, python-dotenv, ...^)...
   call "%VENV_DIR%\Scripts\activate.bat"
-  python -m pip install --upgrade omnivoice "flask>=3.0"
+  if exist "%~dp0requirements.txt" (
+    python -m pip install -r "%~dp0requirements.txt" --upgrade
+  ) else (
+    python -m pip install --upgrade omnivoice "flask>=3.0"
+  )
   if errorlevel 1 echo  pip upgrade had warnings  - run  setup.bat install  if imports break.
 )
 exit /b 0

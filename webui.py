@@ -422,30 +422,77 @@ def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path
     return float(pred_sec)
 
 
-def _to_numpy_mono_1d(audio) -> "np.ndarray":
-    """Turn model output (torch.Tensor, ndarray, or tensor from another ``torch`` build) into 1D float32 [-1, 1].
+def _unwrap_single_container(x, max_depth: int = 8) -> object:
+    """Unwrap ``[[tensor]]`` / ``(tensor,)`` so we operate on the inner segment."""
+    t = x
+    d = 0
+    while d < max_depth and isinstance(t, (list, tuple)) and len(t) == 1:
+        t = t[0]
+        d += 1
+    return t
 
-    We duck-type tensors because ``isinstance(x, torch.Tensor)`` is false when
-    the model and web UI load two different ``torch`` packages, which would
-    otherwise leave a Tensor on the ``numpy`` path and break ``.astype``.
+
+def _is_torchish(x) -> bool:
+    """True for PyTorch tensors (any ``torch`` build) and similar."""
+    if x is None:
+        return False
+    name = type(x).__name__
+    if name in ("Tensor", "Parameter", "BatchedTensor"):
+        return True
+    return all(hasattr(x, a) for a in ("detach", "cpu", "numpy"))
+
+
+def _torchish_to_numpy_float32_1d(t) -> "np.ndarray":
+    """Convert a single tensor to 1D float32 numpy in ~[-1, 1] (no ``.astype`` on Tensor)."""
+    import numpy as np
+
+    t2 = t.detach()
+    if t2.dim() > 1:
+        t2 = t2.mean(dim=0) if t2.size(0) > 1 else t2.squeeze(0)
+    t2 = t2.clamp(-1.0, 1.0).float().cpu().contiguous()
+    return np.ravel(np.asarray(t2.numpy(), dtype=np.float32))
+
+
+def _to_numpy_mono_1d(audio) -> "np.ndarray":
+    """Model waveform → 1D float32 numpy. Safe when multiple ``torch`` copies are loaded
+    (``isinstance(x, torch.Tensor)`` can lie), and when ``np.asarray`` yields an object array.
     """
     import numpy as np
 
-    t = audio
-    if hasattr(t, "detach") and hasattr(t, "cpu") and callable(getattr(t, "numpy", None)):
-        t = t.detach()
-        if t.dim() > 1:
-            t = t.mean(dim=0) if t.size(0) > 1 else t.squeeze(0)
-        t = t.clamp(-1.0, 1.0).cpu()
-        arr = np.asarray(t.numpy(), dtype=np.float32)
-    else:
-        arr = np.asarray(audio, dtype=np.float32)
-        if arr.ndim > 1:
-            arr = arr.mean(axis=0) if arr.shape[0] > 1 else arr.squeeze(0)
-        arr = np.clip(arr, -1.0, 1.0).astype(np.float32)
-    if getattr(arr, "ndim", 0) == 0:
-        arr = arr.reshape(1)
-    return arr.ravel()
+    t = _unwrap_single_container(audio)
+    for _ in range(4):
+        if not _is_torchish(t):
+            break
+        t = _torchish_to_numpy_float32_1d(t)
+    if not isinstance(t, np.ndarray):
+        t = np.asarray(t, dtype=np.float32)
+    if t.dtype == object:
+        parts: list = []
+        for x in t.ravel():
+            u = _unwrap_single_container(x)
+            if _is_torchish(u):
+                parts.append(_torchish_to_numpy_float32_1d(u))
+            else:
+                parts.append(np.ravel(np.asarray(u, dtype=np.float32)))
+        t = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
+    if t.ndim > 1:
+        t = t.mean(axis=0) if t.shape[0] > 1 else t.squeeze(0)
+    t = np.clip(t.astype(np.float32, copy=False), -1.0, 1.0)
+    if t.ndim == 0:
+        t = t.reshape(1)
+    return t.ravel()
+
+
+def _coerce_model_generate_out(gout) -> object:
+    """``generate()`` returns ``(audio0, …)`` or, on some versions, a tensor directly."""
+    if gout is None:
+        raise ValueError("Model returned no audio")
+    if isinstance(gout, (list, tuple)) and len(gout) == 0:
+        raise ValueError("Model returned empty audio")
+    o = gout[0] if isinstance(gout, (list, tuple)) else gout
+    if o is None:
+        raise ValueError("Model returned no audio")
+    return _unwrap_single_container(o)
 
 
 def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
@@ -460,7 +507,10 @@ def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
     import numpy as np
 
     arr = _to_numpy_mono_1d(audio)
-    pcm = (arr * 32767.0).astype(np.int16)
+    if _is_torchish(arr) or type(arr).__name__ == "Tensor":
+        arr = _torchish_to_numpy_float32_1d(arr)
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    pcm = (arr * 32767.0).clip(-32768, 32767).astype(np.int16)
     buf = io.BytesIO()
     with _wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
@@ -1171,7 +1221,7 @@ def generate():
                 status=400,
                 mimetype="text/plain",
             )
-        wav_bytes = _audio_tensor_to_wav_bytes(audio[0], sr)
+        wav_bytes = _audio_tensor_to_wav_bytes(_coerce_model_generate_out(audio), sr)
         headers = {
             "Content-Disposition": "inline; filename=omnivoice_out.wav",
         }
@@ -1308,7 +1358,7 @@ def generate_design():
                 status=400,
                 mimetype="text/plain",
             )
-        wav_bytes = _audio_tensor_to_wav_bytes(audio[0], sr)
+        wav_bytes = _audio_tensor_to_wav_bytes(_coerce_model_generate_out(audio), sr)
         if save_lock:
             try:
                 WEBUI_DATA_DIR.mkdir(parents=True, exist_ok=True)
