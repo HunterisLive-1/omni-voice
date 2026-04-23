@@ -465,7 +465,10 @@ def _is_torchish(x) -> bool:
     if x is None:
         return False
     name = type(x).__name__
-    if name in ("Tensor", "Parameter", "BatchedTensor"):
+    if name in ("Tensor", "Parameter", "BatchedTensor") or name.endswith("Tensor"):
+        return True
+    module = getattr(type(x), "__module__", "") or ""
+    if module.startswith("torch"):
         return True
     return all(hasattr(x, a) for a in ("detach", "cpu", "numpy"))
 
@@ -505,7 +508,12 @@ def _to_numpy_mono_1d(audio) -> "np.ndarray":
         t = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
     if t.ndim > 1:
         t = t.mean(axis=0) if t.shape[0] > 1 else t.squeeze(0)
-    t = np.clip(t.astype(np.float32, copy=False), -1.0, 1.0)
+    # Final safety: tensor may have slipped through object-array path on CPU
+    if _is_torchish(t) or (hasattr(t, "detach") and not isinstance(t, np.ndarray)):
+        t = _torchish_to_numpy_float32_1d(t)
+    elif not isinstance(t, np.ndarray):
+        t = np.asarray(t, dtype=np.float32)
+    t = np.clip(np.asarray(t, dtype=np.float32), -1.0, 1.0)
     if t.ndim == 0:
         t = t.reshape(1)
     return t.ravel()
@@ -535,9 +543,9 @@ def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
     import numpy as np
 
     arr = _to_numpy_mono_1d(audio)
-    if _is_torchish(arr) or type(arr).__name__ == "Tensor":
+    if _is_torchish(arr):
         arr = _torchish_to_numpy_float32_1d(arr)
-    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    arr = np.asarray(arr, dtype=np.float32)
     pcm = (arr * 32767.0).clip(-32768, 32767).astype(np.int16)
     buf = io.BytesIO()
     with _wave.open(buf, "wb") as wf:
@@ -668,6 +676,10 @@ def _get_device_dtype():
         _device_info = "CPU"
         print("[OmniVoice] Running on CPU.", flush=True)
 
+    print(
+        "[OmniVoice] CPU mode: float32, tensor→numpy conversion active.",
+        flush=True,
+    )
     return "cpu", torch.float32
 
 

@@ -691,7 +691,7 @@ echo === PyTorch CUDA 11.8 ^(driver ^>= 452, older GTX/RTX cards^) ===
 call "%VENV_DIR%\Scripts\activate.bat"
 python -m pip uninstall -y torch torchaudio torchvision 2>nul
 python -m pip cache purge
-python -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu118
+python -m pip install torch==2.8.0+cu118 torchaudio==2.8.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
 if errorlevel 1 exit /b 1
 python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
 if errorlevel 1 exit /b 1
@@ -716,7 +716,7 @@ echo === PyTorch CUDA 12.1 ^(driver ^>= 530^) ===
 call "%VENV_DIR%\Scripts\activate.bat"
 python -m pip uninstall -y torch torchaudio torchvision 2>nul
 python -m pip cache purge
-python -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu121
+python -m pip install torch==2.8.0+cu121 torchaudio==2.8.0+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
 if errorlevel 1 exit /b 1
 python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
 if errorlevel 1 exit /b 1
@@ -741,7 +741,7 @@ echo === PyTorch CUDA 12.4 ^(driver ^>= 550^) ===
 call "%VENV_DIR%\Scripts\activate.bat"
 python -m pip uninstall -y torch torchaudio torchvision 2>nul
 python -m pip cache purge
-python -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu124
+python -m pip install torch==2.8.0+cu124 torchaudio==2.8.0+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
 if errorlevel 1 exit /b 1
 python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
 if errorlevel 1 exit /b 1
@@ -937,11 +937,11 @@ echo   Installing PyTorch ^(this can take a few minutes^)...
 if "!TORCH_CHOICE!"=="1" (
     "%VPY%" -m pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
 ) else if "!TORCH_CHOICE!"=="2" (
-    "%VPY%" -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu118
+    "%VPY%" -m pip install torch==2.8.0+cu118 torchaudio==2.8.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
 ) else if "!TORCH_CHOICE!"=="3" (
-    "%VPY%" -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu124
+    "%VPY%" -m pip install torch==2.8.0+cu124 torchaudio==2.8.0+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
 ) else if "!TORCH_CHOICE!"=="4" (
-    "%VPY%" -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu121
+    "%VPY%" -m pip install torch==2.8.0+cu121 torchaudio==2.8.0+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
 ) else (
     "%VPY%" -m pip install torch==2.8.0 torchaudio==2.8.0
 )
@@ -960,6 +960,7 @@ echo.
 REM -----------------------------------------------------------------
 echo   [Step 5 of 6]  Installing OmniVoice + Flask...
 echo.
+"%VPY%" -m pip install "numpy<2.0" --quiet
 "%VPY%" -m pip install omnivoice "flask>=3.0"
 if errorlevel 1 (
   echo.
