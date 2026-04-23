@@ -413,6 +413,32 @@ def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path
     return float(pred_sec)
 
 
+def _to_numpy_mono_1d(audio) -> "np.ndarray":
+    """Turn model output (torch.Tensor, ndarray, or tensor from another ``torch`` build) into 1D float32 [-1, 1].
+
+    We duck-type tensors because ``isinstance(x, torch.Tensor)`` is false when
+    the model and web UI load two different ``torch`` packages, which would
+    otherwise leave a Tensor on the ``numpy`` path and break ``.astype``.
+    """
+    import numpy as np
+
+    t = audio
+    if hasattr(t, "detach") and hasattr(t, "cpu") and callable(getattr(t, "numpy", None)):
+        t = t.detach()
+        if t.dim() > 1:
+            t = t.mean(dim=0) if t.size(0) > 1 else t.squeeze(0)
+        t = t.clamp(-1.0, 1.0).cpu()
+        arr = np.asarray(t.numpy(), dtype=np.float32)
+    else:
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.ndim > 1:
+            arr = arr.mean(axis=0) if arr.shape[0] > 1 else arr.squeeze(0)
+        arr = np.clip(arr, -1.0, 1.0).astype(np.float32)
+    if getattr(arr, "ndim", 0) == 0:
+        arr = arr.reshape(1)
+    return arr.ravel()
+
+
 def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
     """Convert a float32 audio signal to 16-bit PCM WAV bytes using stdlib wave.
 
@@ -424,23 +450,7 @@ def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
     import wave as _wave
     import numpy as np
 
-    try:
-        import torch
-        is_torch_tensor = isinstance(audio, torch.Tensor)
-    except ImportError:
-        is_torch_tensor = False
-
-    if is_torch_tensor:
-        t = audio.detach()
-        if t.dim() > 1:
-            t = t.mean(dim=0) if t.size(0) > 1 else t.squeeze(0)
-        arr = t.clamp(-1.0, 1.0).cpu().numpy()
-    else:
-        arr = np.asarray(audio)
-        if arr.ndim > 1:
-            arr = arr.mean(axis=0) if arr.shape[0] > 1 else arr.squeeze(0)
-        arr = np.clip(arr, -1.0, 1.0)
-
+    arr = _to_numpy_mono_1d(audio)
     pcm = (arr * 32767.0).astype(np.int16)
     buf = io.BytesIO()
     with _wave.open(buf, "wb") as wf:
