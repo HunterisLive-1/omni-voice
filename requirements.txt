@@ -20,4 +20,5 @@
 omnivoice
 accelerate>=1.0
 flask>=3.0
+python-dotenv>=1.0.0
 # Never: pip install --force-reinstall accelerate  without  --no-deps  (pip pulls CPU torch 2.11 and breaks torchaudio+cu128)

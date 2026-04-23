@@ -3,6 +3,15 @@ OmniVoice local Web UI — opens in your browser when you run run.bat.
 """
 from __future__ import annotations
 
+# Optional: load a project ``.env`` (API keys, OMNIVOICE_PORT, etc.). Works without
+# ``python-dotenv``; install it with: pip install python-dotenv  or  setup.bat install
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 import os
 import re
 import subprocess
