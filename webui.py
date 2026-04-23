@@ -12,6 +12,7 @@ try:
 except ImportError:
     pass
 
+import json
 import os
 import re
 import subprocess
@@ -50,6 +51,12 @@ except ImportError:
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@HunterIsLive-18"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = int(os.environ.get("OMNIVOICE_PORT", "8765"))
+
+# Web UI “update available” banner — same repo as setup.bat / update.bat
+PROJECT_ROOT = Path(__file__).resolve().parent
+GITHUB_UPDATE_OWNER = "HunterisLive-1"
+GITHUB_UPDATE_REPO = "omni-voice"
+GITHUB_UPDATE_BRANCH = "main"
 
 # Local data: reference transcript cache (SHA256 → text) and optional design voice lock WAV.
 WEBUI_DATA_DIR = Path(__file__).resolve().parent / "webui_data"
@@ -422,6 +429,27 @@ def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path
     return float(pred_sec)
 
 
+def _wall_clock_estimate_for_progress(
+    predicted_output_sec: float | None, device_info: str
+) -> float | None:
+    """Turn predicted *WAV length* (sec) into a rough *real time* to finish generation.
+
+    The model's ``duration`` is audio length, not RTX/CPU time — the old code used
+    the same value for the terminal bar, so 0–99% finished in ~audio-length
+    seconds while actual decode could be 5–10× longer on GPU (and more on CPU).
+    """
+    if predicted_output_sec is None or predicted_output_sec < 0.05:
+        return None
+    p = float(predicted_output_sec)
+    di = (device_info or "").lower()
+    if "cpu" in di and "cuda" not in di:
+        mult = 22.0
+    else:
+        mult = 6.0
+    w = max(40.0, p * mult)
+    return min(w, 1200.0)
+
+
 def _unwrap_single_container(x, max_depth: int = 8) -> object:
     """Unwrap ``[[tensor]]`` / ``(tensor,)`` so we operate on the inner segment."""
     t = x
@@ -523,24 +551,40 @@ def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
 class _GenProgress:
     """Live terminal progress bar while model.generate() runs.
 
+    * ``output_sec`` = model's predicted *audio* length (same idea as generate duration).
+    * ``bar_wall_sec`` = rough *wall-clock* budget for the bar (decode is much slower
+      than real-time; do not use output_sec for the bar).
+
     Usage::
-        with _GenProgress("Voice Clone", est_sec=14.0):
+        with _GenProgress("Voice Clone", output_sec=22.0, bar_wall_sec=130.0):
             audio = model.generate(...)
     """
 
     _SPIN = ["|", "/", "-", "\\"]
     _BAR_W = 22
 
-    def __init__(self, mode: str, est_sec: float | None = None):
+    def __init__(
+        self,
+        mode: str,
+        *,
+        output_sec: float | None = None,
+        bar_wall_sec: float | None = None,
+    ) -> None:
         self._mode = mode
-        self._est = est_sec
+        self._out = output_sec
+        self._bar = bar_wall_sec
         self._t0 = 0.0
         self._done = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
     def __enter__(self):
         self._t0 = time.time()
-        est_str = f"  (est. ~{self._est:.0f}s)" if self._est else ""
+        bits: list[str] = []
+        if self._out and self._out > 0.1:
+            bits.append(f"audio ~{self._out:.0f}s out")
+        if self._bar and self._bar > 1.0:
+            bits.append(f"~{self._bar:.0f}s compute est.")
+        est_str = f"  ({' · '.join(bits)})" if bits else ""
         print(f"[OmniVoice] Generating {self._mode}…{est_str}", flush=True)
         self._thread.start()
         return self
@@ -556,13 +600,23 @@ class _GenProgress:
             flush=True,
         )
 
+    @staticmethod
+    def _bar_fraction(elapsed: float, initial_wall: float) -> float:
+        """0..0.99; if we're past the estimate, stretch the target so the bar can move on."""
+        if initial_wall <= 1.0:
+            return 0.0
+        denom = initial_wall
+        if elapsed > denom * 0.88:
+            denom = max(denom, elapsed / 0.9 + 3.0)
+        return min(elapsed / denom, 0.99)
+
     def _loop(self):
         idx = 0
         while not self._done.wait(0.3):
             elapsed = time.time() - self._t0
             spin = self._SPIN[idx % len(self._SPIN)]
-            if self._est and self._est > 1.0:
-                frac = min(elapsed / self._est, 0.99)
+            if self._bar and self._bar > 1.0:
+                frac = self._bar_fraction(elapsed, self._bar)
                 filled = int(frac * self._BAR_W)
                 bar = "#" * filled + "." * (self._BAR_W - filled)
                 pct = int(frac * 100)
@@ -830,6 +884,49 @@ PAGE_HTML = """<!DOCTYPE html>
       background: linear-gradient(120deg, var(--accent), #4f7ae8);
       border-color: transparent;
     }
+    .update-strip {
+      display: none;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem 1rem;
+      margin-bottom: 1.1rem;
+      padding: 0.75rem 1rem;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #0f1219;
+      font-size: 0.88rem;
+      text-align: left;
+    }
+    .update-strip.show { display: flex; }
+    .update-strip.outdated {
+      border-color: #a16207;
+      background: linear-gradient(135deg, #1a1508 0%, #0f1219 100%);
+      color: #fcd34d;
+    }
+    .update-strip.current {
+      border-color: #14532d;
+      background: linear-gradient(135deg, #0c1a12 0%, #0f1219 100%);
+      color: #86efac;
+    }
+    .update-strip .update-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem 0.65rem;
+      align-items: center;
+      justify-content: center;
+    }
+    .update-strip button.update-btn {
+      width: auto;
+      margin: 0;
+      padding: 0.45rem 0.95rem;
+      font-size: 0.85rem;
+      background: linear-gradient(120deg, var(--accent), #4f7ae8);
+    }
+    .update-strip a.update-link {
+      color: #93c5fd;
+      font-weight: 500;
+    }
   </style>
 </head>
 <body>
@@ -998,6 +1095,13 @@ PAGE_HTML = """<!DOCTYPE html>
     </div>
 
     <footer>
+      <div id="update-strip" class="update-strip show" role="status" aria-live="polite">
+        <span id="update-strip-msg">Checking for updates…</span>
+        <div class="update-actions">
+          <a id="update-repo-link" class="update-link" href="https://github.com/HunterisLive-1/omni-voice" target="_blank" rel="noopener">GitHub</a>
+          <button type="button" id="update-run-btn" class="update-btn" style="display:none">Run update</button>
+        </div>
+      </div>
       <p>OmniVoice model: <a href="https://huggingface.co/k2-fsa/OmniVoice" target="_blank" rel="noopener">k2-fsa/OmniVoice</a></p>
       <p>WebUI by HunterIsLive — <a href="{{ yt_url }}" target="_blank" rel="noopener noreferrer">youtube.com/@HunterIsLive-18</a></p>
     </footer>
@@ -1055,6 +1159,58 @@ PAGE_HTML = """<!DOCTYPE html>
       }
       btn.disabled = false;
     });
+
+    (function updateBanner() {
+      const strip = document.getElementById("update-strip");
+      const msg = document.getElementById("update-strip-msg");
+      const runBtn = document.getElementById("update-run-btn");
+      const link = document.getElementById("update-repo-link");
+      if (!strip || !msg) return;
+      async function refresh() {
+        try {
+          const r = await fetch("/api/update-check");
+          const j = await r.json();
+          if (!j.ok) {
+            strip.className = "update-strip show";
+            msg.textContent = "Could not check for updates.";
+            return;
+          }
+          if (link && j.repo_html) link.href = j.repo_html;
+          strip.className = "update-strip show";
+          if (j.update_available === true) {
+            strip.classList.add("outdated");
+            msg.textContent = "Update available — you have " + (j.local_short || "?") + ", GitHub main is " + (j.remote_short || "?") + ".";
+          } else if (j.update_available === false) {
+            strip.classList.add("current");
+            msg.textContent = "You are on the latest version (" + (j.local_short || j.remote_short || "") + ").";
+          } else {
+            msg.textContent = j.hint || "Run update.bat in the project folder to sync with GitHub.";
+          }
+          if (runBtn) {
+            runBtn.style.display = j.can_run_update ? "inline-block" : "none";
+            runBtn.disabled = false;
+          }
+        } catch (_) {
+          strip.className = "update-strip show";
+          msg.textContent = "Could not check for updates (browser or network).";
+        }
+      }
+      refresh();
+      if (runBtn) {
+        runBtn.addEventListener("click", async function () {
+          if (this.disabled) return;
+          this.disabled = true;
+          try {
+            const r = await fetch("/api/run-update", { method: "POST" });
+            const j = await r.json();
+            alert(j.message || (j.ok ? "OK" : "Failed"));
+          } catch (e) {
+            alert(e && e.message ? e.message : String(e));
+          }
+          this.disabled = false;
+        });
+      }
+    })();
   </script>
 </body>
 </html>
@@ -1077,6 +1233,69 @@ def _render_ui(page: str):
         design_voice_keys=DESIGN_VOICE_ORDER,
         design_voice_presets=DESIGN_VOICE_PROFILES,
     )
+
+
+def _local_git_head_sha() -> str | None:
+    ref = PROJECT_ROOT / ".git" / "refs" / "heads" / GITHUB_UPDATE_BRANCH
+    if ref.is_file():
+        try:
+            s = ref.read_text(encoding="utf-8").strip()
+            if len(s) >= 7:
+                return s
+        except OSError:
+            pass
+    run_kw: dict = {
+        "args": ["git", "rev-parse", "HEAD"],
+        "cwd": str(PROJECT_ROOT),
+        "capture_output": True,
+        "text": True,
+        "timeout": 6,
+    }
+    if sys.platform == "win32":
+        run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        r = subprocess.run(**run_kw)
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return (r.stdout or "").strip()
+    except OSError:
+        pass
+    return None
+
+
+def _github_latest_commit_sha() -> str | None:
+    import urllib.error
+    import urllib.request
+
+    url = (
+        f"https://api.github.com/repos/{GITHUB_UPDATE_OWNER}/{GITHUB_UPDATE_REPO}"
+        f"/commits/{GITHUB_UPDATE_BRANCH}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "OmniVoice-WebUI/1.0",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.load(resp)
+        sha = data.get("sha")
+        if isinstance(sha, str) and len(sha) >= 7:
+            return sha
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _client_is_trusted_localhost(req) -> bool:
+    a = (req.remote_addr or "").strip().lower()
+    if a in ("127.0.0.1", "::1", "localhost"):
+        return True
+    if a.startswith("127.") or a.startswith("::ffff:127."):
+        return True
+    return False
 
 
 @_app.route("/")
@@ -1107,6 +1326,87 @@ def api_retry_load():
         return jsonify(ok=False, message="Load already in progress"), 409
     _ensure_load_started(force=True)
     return jsonify(ok=True)
+
+
+@_app.route("/api/update-check")
+def api_update_check():
+    """Compare local git HEAD with GitHub main (public API)."""
+    repo_html = f"https://github.com/{GITHUB_UPDATE_OWNER}/{GITHUB_UPDATE_REPO}"
+    can_run = _client_is_trusted_localhost(request)
+    local = _local_git_head_sha()
+    remote = _github_latest_commit_sha()
+    local_s = (local or "")[:7] if local else None
+    remote_s = (remote or "")[:7] if remote else None
+
+    if not remote:
+        return jsonify(
+            ok=True,
+            local_sha=local,
+            local_short=local_s,
+            remote_sha=None,
+            remote_short=None,
+            update_available=None,
+            hint="Could not reach GitHub (offline or rate limit). You can still run update.bat manually.",
+            repo_html=repo_html,
+            can_run_update=can_run,
+        )
+    if not local:
+        return jsonify(
+            ok=True,
+            local_sha=None,
+            local_short=None,
+            remote_sha=remote,
+            remote_short=remote_s,
+            update_available=None,
+            hint=f"Latest on GitHub main: {remote_s}. If you used a ZIP, run update.bat in the project folder to sync.",
+            repo_html=repo_html,
+            can_run_update=can_run,
+        )
+
+    same = local[:40] == remote[:40] if len(local) >= 40 and len(remote) >= 40 else local == remote
+    return jsonify(
+        ok=True,
+        local_sha=local,
+        local_short=local_s,
+        remote_sha=remote,
+        remote_short=remote_s,
+        update_available=(not same),
+        hint=None,
+        repo_html=repo_html,
+        can_run_update=can_run,
+    )
+
+
+@_app.route("/api/run-update", methods=["POST"])
+def api_run_update():
+    """Open update.bat (Windows) — only from localhost; user restarts run.bat after."""
+    if not _client_is_trusted_localhost(request):
+        return jsonify(
+            ok=False,
+            message="Updates can only be started from this PC (open the Web UI at 127.0.0.1).",
+        ), 403
+    bat = PROJECT_ROOT / "update.bat"
+    if not bat.is_file():
+        return jsonify(
+            ok=False,
+            message="update.bat not found in the project folder.",
+        ), 404
+    if sys.platform != "win32":
+        return jsonify(
+            ok=False,
+            message="One-click update is for Windows. Otherwise: git pull or re-download from GitHub.",
+        ), 400
+    try:
+        os.startfile(str(bat))  # noqa: S606
+    except OSError as e:
+        return jsonify(ok=False, message=str(e)), 500
+    return jsonify(
+        ok=True,
+        message=(
+            "update.bat should open in a new window. When it finishes, stop this Web UI "
+            "(Ctrl+C in the black console) and start run.bat again."
+        ),
+    )
 
 
 @_app.route("/generate", methods=["POST"])
@@ -1211,8 +1511,13 @@ def generate():
 
         preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
         print(f'[OmniVoice] Text: "{preview}"', flush=True)
+        wall = _wall_clock_estimate_for_progress(est_sec, _device_info)
         try:
-            with _GenProgress("Voice Clone", est_sec=est_sec):
+            with _GenProgress(
+                "Voice Clone",
+                output_sec=est_sec,
+                bar_wall_sec=wall,
+            ):
                 with _model_lock:
                     audio = _model.generate(**call_kw)
         except ValueError as e:
@@ -1348,8 +1653,13 @@ def generate_design():
         preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
         print(f'[OmniVoice] Text: "{preview}"', flush=True)
         label = "Voice Design (locked ref)" if use_lock else "Voice Design"
+        wall = _wall_clock_estimate_for_progress(est_sec, _device_info)
         try:
-            with _GenProgress(label, est_sec=est_sec):
+            with _GenProgress(
+                label,
+                output_sec=est_sec,
+                bar_wall_sec=wall,
+            ):
                 with _model_lock:
                     audio = _model.generate(**call_kw)
         except ValueError as e:
