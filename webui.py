@@ -80,6 +80,7 @@ _model_lock = threading.Lock()
 _load_error: str | None = None
 _load_thread: threading.Thread | None = None
 _device_info: str = "detecting…"
+_omnivoice_tensor_to_audiosegment_patched: bool = False
 
 # Speaking-style presets: OmniVoice only accepts specific instruct tokens (see README).
 # We map “narrator / storyteller / …” to those tags plus decoding options (speed, steps, chunking).
@@ -362,10 +363,54 @@ def _ensure_whisper_pipeline(model) -> None:
     model.load_asr_model(model_name=mid)
 
 
+def _patch_omnivoice_tensor_to_audiosegment() -> None:
+    """Work around ``'Tensor' object has no attribute 'astype'`` in omnivoice.
+
+    Upstream ``tensor_to_audiosegment`` does ``(np * scale).clip().astype``; with
+    NumPy + PyTorch ufunc interop the middle expression can stay a ``Tensor``.
+    That hits users on **CPU** when ``trim_long_audio`` runs (WebUI preprocess
+    or ``OmniVoice.generate`` for long reference audio). Not a broken pip cache.
+    """
+    global _omnivoice_tensor_to_audiosegment_patched
+    if _omnivoice_tensor_to_audiosegment_patched:
+        return
+    import numpy as np
+    import torch
+    from pydub import AudioSegment
+
+    import omnivoice.utils.audio as ov_audio
+
+    def tensor_to_audiosegment(tensor: torch.Tensor, sample_rate: int):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError("tensor_to_audiosegment expects a torch.Tensor")
+        audio_np = np.asarray(
+            tensor.detach().cpu().float().contiguous(),
+            dtype=np.float64,
+        )
+        audio_np = np.clip(
+            np.rint(audio_np * 32768.0),
+            -32768,
+            32767,
+        ).astype(np.int16)
+        if audio_np.shape[0] > 1:
+            audio_np = audio_np.transpose(1, 0).flatten()
+        audio_bytes = audio_np.tobytes()
+        return AudioSegment(
+            data=audio_bytes,
+            sample_width=2,
+            frame_rate=sample_rate,
+            channels=tensor.shape[0],
+        )
+
+    ov_audio.tensor_to_audiosegment = tensor_to_audiosegment  # type: ignore[method-assign]
+    _omnivoice_tensor_to_audiosegment_patched = True
+
+
 def _preprocess_reference_wav(
     in_path: str, out_path: str, target_sr: int
 ) -> tuple[list[str], float]:
     """Mono, resample, trim clips longer than ~10s. Returns (warnings, duration sec)."""
+    _patch_omnivoice_tensor_to_audiosegment()
     import torchaudio
     from omnivoice.utils.audio import trim_long_audio
 
@@ -750,6 +795,7 @@ def _load_model_blocking() -> None:
         if _model is not None:
             return
         try:
+            _patch_omnivoice_tensor_to_audiosegment()
             from omnivoice import OmniVoice
 
             device, dtype = _get_device_dtype()
