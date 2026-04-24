@@ -61,7 +61,7 @@ GITHUB_UPDATE_BRANCH = "main"
 # Local data: reference transcript cache (SHA256 → text) and optional design voice lock WAV.
 WEBUI_DATA_DIR = Path(__file__).resolve().parent / "webui_data"
 # Voice clone: user reference WAV must not exceed this (avoids long-clip / pydub issues).
-REF_AUDIO_MAX_DURATION_SEC = 10.0
+REF_AUDIO_MAX_DURATION_SEC = 15.0
 REF_MIN_WARN_SEC = 3.0
 DESIGN_LOCK_WAV = WEBUI_DATA_DIR / "design_voice_lock.wav"
 WHISPER_MODEL_FILE = WEBUI_DATA_DIR / "whisper_model.txt"
@@ -515,7 +515,7 @@ def _preprocess_reference_wav(
     dur = w.shape[1] / float(target_sr)
     if dur < REF_MIN_WARN_SEC:
         warnings.append(
-            f"Reference audio is only {dur:.1f}s; 3–10s of clear speech is recommended."
+            f"Reference audio is only {dur:.1f}s; 3–15s of clear speech is recommended."
         )
     torchaudio.save(out_path, w, target_sr)
     return warnings, dur
