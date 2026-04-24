@@ -11,6 +11,10 @@ If loading fails with "does not appear to have ... model.safetensors":
   Often the HF cache is incomplete, or ``model.safetensors`` is a tiny Git LFS
   pointer. Try setup.bat model re-download, or move the project to a simple path
   (avoid emoji/special chars), or set ``HF_HOME`` / ``HF_HUB_CACHE`` to an ASCII path.
+
+VRAM:
+  Weights load only when you press **Generate speech** (first POST to
+  ``/generate`` or ``/generate-design``), not when the server or browser starts.
 """
 from __future__ import annotations
 
@@ -1175,6 +1179,18 @@ def _ensure_load_started(force: bool = False) -> None:
     _load_thread.start()
 
 
+def _wait_for_model_ready(timeout_sec: float = 1200.0, poll: float = 0.25) -> bool:
+    """Block after :func:`_ensure_load_started` until weights are ready or error."""
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if _load_error:
+            return False
+        if _model is not None:
+            return True
+        time.sleep(poll)
+    return False
+
+
 PAGE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1420,17 +1436,15 @@ PAGE_HTML = """<!DOCTYPE html>
       });
     </script>
     {% elif not model_ready %}
-    <div class="card" id="loader-card">
-      <p class="status" id="loader-msg">Loading OmniVoice model… first run may download weights. This can take several minutes.</p>
-      <p class="hint" id="device-hint">Device: <span id="device-label">{{ device_info }}</span></p>
-      <p class="hint">You can subscribe on YouTube while you wait — link above.</p>
+    <div class="card" id="defer-hint-card">
+      <p class="status">GPU memory stays free until you press <strong>Generate speech</strong>. The first run may take several minutes while weights load.</p>
     </div>
     {% endif %}
     {% if model_ready and not load_error %}
     <p class="hint" style="text-align:center;margin-bottom:0.5rem">Device: {{ device_info }}</p>
     {% endif %}
 
-    <div class="card" id="main-card" {% if not model_ready or load_error %}style="display:none"{% endif %}>
+    <div class="card" id="main-card" {% if load_error %}style="display:none"{% endif %}>
       {% if page == 'clone' %}
       <form id="gen-form" method="post" action="/generate" enctype="multipart/form-data">
         <div class="row">
@@ -1485,7 +1499,7 @@ PAGE_HTML = """<!DOCTYPE html>
           <textarea id="text" name="text" required
             placeholder="Type what you want the cloned voice to say...">{{ ui_clone['text']|e }}</textarea>
         </div>
-        <button type="submit" id="submit-btn" {% if load_error or not model_ready %}disabled{% endif %}>Generate speech</button>
+        <button type="submit" id="submit-btn" {% if load_error %}disabled{% endif %}>Generate speech</button>
         <p class="hint">First generation may take longer while the model warms up. Runs on your machine only. After a successful run, choices on this tab are saved locally and restored when you open the page again.</p>
       </form>
       {% else %}
@@ -1550,9 +1564,9 @@ PAGE_HTML = """<!DOCTYPE html>
         </div>
         <div class="row">
           <label><input type="checkbox" name="save_design_voice_lock" value="1" {% if ui_design['save_design_voice_lock'] %}checked{% endif %} /> After this run, save output as my design voice</label>
-          <p class="hint">Saves the WAV plus this page’s “Text to speak” as the lock transcript (needed for “Use saved design voice” without Whisper).</p>
+          <p class="hint">Saves the WAV plus this page’s “Text to speak” as the lock transcript (needed for “Use saved design voice”).</p>
         </div>
-        <button type="submit" id="submit-btn" {% if load_error or not model_ready %}disabled{% endif %}>Generate speech</button>
+        <button type="submit" id="submit-btn" {% if load_error %}disabled{% endif %}>Generate speech</button>
         <p class="hint">No WAV upload needed — describes the voice in text instead of cloning a sample. After a successful run, choices on this tab are saved locally and restored when you open the page again.</p>
       </form>
       {% endif %}
@@ -1583,28 +1597,6 @@ PAGE_HTML = """<!DOCTYPE html>
     const form = document.getElementById("gen-form") || document.getElementById("design-form");
     const btn = document.getElementById("submit-btn");
     const result = document.getElementById("result");
-    const mainCard = document.getElementById("main-card");
-    const loaderCard = document.getElementById("loader-card");
-
-    async function pollStatus() {
-      if (!loaderCard || mainCard.style.display !== "none") return;
-      try {
-        const r = await fetch("/api/status");
-        const j = await r.json();
-        if (j.error) {
-          location.reload();
-          return;
-        }
-        const lbl = document.getElementById("device-label");
-        if (lbl && j.device) lbl.textContent = j.device;
-        if (j.ready) {
-          loaderCard.style.display = "none";
-          mainCard.style.display = "block";
-          btn.disabled = false;
-        }
-      } catch (_) { /* ignore */ }
-    }
-    if (loaderCard) setInterval(pollStatus, 2000);
 
     const refIn = document.getElementById("ref_audio");
     const refHint = document.getElementById("ref-audio-duration-hint");
@@ -1760,7 +1752,6 @@ PAGE_HTML = """<!DOCTYPE html>
 
 
 def _render_ui(page: str):
-    _ensure_load_started()
     _raw_ui = _load_last_ui_settings()
     ui_clone = _resolved_clone_defaults(_raw_ui.get("clone"))
     ui_design = _resolved_design_defaults(_raw_ui.get("design"))
@@ -1859,11 +1850,11 @@ def sound_design():
 
 @_app.route("/api/status")
 def api_status():
-    _ensure_load_started()
     return jsonify(
         ready=_model is not None,
         error=bool(_load_error),
         device=_device_info,
+        defer_load=True,
     )
 
 
@@ -1961,11 +1952,12 @@ def api_run_update():
 @_app.route("/generate", methods=["POST"])
 def generate():
     _ensure_load_started()
-    if _load_error:
-        return Response(_load_error, status=503, mimetype="text/plain")
-    if _model is None:
+    if not _wait_for_model_ready():
+        if _load_error:
+            return Response(_load_error, status=503, mimetype="text/plain")
         return Response(
-            "Model is still loading. Wait a few seconds and try again.",
+            "Model load timed out (still downloading or disk busy). Try again in a minute.\n\n"
+            "मॉडल लोड समय समाप्त — कुछ देर बाद फिर कोशिश करें।",
             status=503,
             mimetype="text/plain",
         )
@@ -2089,11 +2081,12 @@ def generate():
 def generate_design():
     """Voice design, optional Hindi pacing, optional locked reference (saved WAV)."""
     _ensure_load_started()
-    if _load_error:
-        return Response(_load_error, status=503, mimetype="text/plain")
-    if _model is None:
+    if not _wait_for_model_ready():
+        if _load_error:
+            return Response(_load_error, status=503, mimetype="text/plain")
         return Response(
-            "Model is still loading. Wait a few seconds and try again.",
+            "Model load timed out (still downloading or disk busy). Try again in a minute.\n\n"
+            "मॉडल लोड समय समाप्त — कुछ देर बाद फिर कोशिश करें।",
             status=503,
             mimetype="text/plain",
         )
@@ -2255,8 +2248,11 @@ def _open_browser_later():
 
 
 def main() -> int:
-    _ensure_load_started()
     print(f"OmniVoice WebUI — http://{DEFAULT_HOST}:{DEFAULT_PORT}/")
+    print(
+        "[OmniVoice] Model loads only after you press Generate speech (not at startup).",
+        flush=True,
+    )
     print("Press Ctrl+C to stop.")
     threading.Thread(target=_open_browser_later, daemon=True).start()
     _app.run(host=DEFAULT_HOST, port=DEFAULT_PORT, debug=False, threaded=True)

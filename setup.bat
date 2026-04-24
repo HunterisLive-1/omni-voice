@@ -1039,6 +1039,8 @@ echo Starting Web UI with:
 echo   %VPY%
 echo   %~dp0webui.py
 echo.
+echo GPU: model loads on first Generate by default (idle VRAM low). Eager load: OMNIVOICE_EAGER_MODEL_LOAD=1
+echo.
 echo If this window closes instantly, open cmd here and run: setup.bat install
 echo.
 
