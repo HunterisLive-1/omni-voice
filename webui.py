@@ -481,7 +481,10 @@ def _torchish_to_numpy_float32_1d(t) -> "np.ndarray":
     if t2.dim() > 1:
         t2 = t2.mean(dim=0) if t2.size(0) > 1 else t2.squeeze(0)
     t2 = t2.clamp(-1.0, 1.0).float().cpu().contiguous()
-    return np.ravel(np.asarray(t2.numpy(), dtype=np.float32))
+    # Prefer ``np.asarray(tensor)`` over ``.numpy()`` so we always get a real ndarray
+    # (avoids odd torch/numpy stacks). Never chain ``np.clip``/``rint`` on a bare Tensor:
+    # NumPy 2 ufuncs may return ``torch.Tensor``, then ``.astype`` fails.
+    return np.ravel(np.asarray(t2, dtype=np.float32))
 
 
 def _to_numpy_mono_1d(audio) -> "np.ndarray":
@@ -547,7 +550,8 @@ def _coerce_wav_float_numpy(audio) -> "np.ndarray":
             and arr.dtype != np.dtype("O")
             and np.issubdtype(arr.dtype, np.number)
         ):
-            out = np.ascontiguousarray(arr, dtype=np.float32).ravel()
+            # Second ``asarray`` forces a NumPy-owned buffer (not a Tensor view).
+            out = np.ravel(np.asarray(arr, dtype=np.float32, order="C"))
             np.clip(out, -1.0, 1.0, out=out)
             return out
         if _is_torchish(arr):
@@ -565,6 +569,19 @@ def _coerce_wav_float_numpy(audio) -> "np.ndarray":
             arr = _torchish_to_numpy_float32_1d(arr)
             continue
         arr = np.asarray(arr, dtype=np.float32)
+
+    try:
+        seq = arr.tolist() if hasattr(arr, "tolist") else arr
+        arr = np.ravel(np.asarray(seq, dtype=np.float32))
+        if arr.size and (
+            isinstance(arr, np.ndarray)
+            and arr.dtype != np.dtype("O")
+            and np.issubdtype(arr.dtype, np.number)
+        ):
+            np.clip(arr, -1.0, 1.0, out=arr)
+            return arr
+    except (TypeError, ValueError):
+        pass
 
     raise RuntimeError(
         "Could not convert generated audio to NumPy (tensor→numpy failed). "
@@ -584,7 +601,10 @@ def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
     import numpy as np
 
     arr = _coerce_wav_float_numpy(audio)
-    pcm = np.clip(np.rint(arr * np.float32(32767.0)), -32768, 32767).astype(np.int16)
+    # NumPy ufuncs on a ``torch.Tensor`` can return Tensor (NumPy 2 interop); then
+    # ``.astype(np.int16)`` raises. Force a host ndarray before any ufunc chain.
+    arr = np.asarray(arr, dtype=np.float64)
+    pcm = np.clip(np.rint(arr * 32767.0), -32768, 32767).astype(np.int16)
     buf = io.BytesIO()
     with _wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
