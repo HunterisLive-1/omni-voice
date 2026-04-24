@@ -11,6 +11,12 @@ TEXT = os.environ.get(
     "OMNIVOICE_TEXT",
     "Hello, this is a test of zero-shot voice cloning.",
 )
+DEFAULT_HUB_MODEL = "k2-fsa/OmniVoice"
+OMNIVOICE_MODEL = (
+    (os.environ.get("OMNIVOICE_MODEL_ID") or os.environ.get("OMNIVOICE_HUB_MODEL") or "")
+    .strip()
+    or DEFAULT_HUB_MODEL
+)
 
 
 def main() -> int:
@@ -28,10 +34,10 @@ def main() -> int:
     dtype = torch.float16 if device.startswith("cuda") else torch.float32
 
     print(f"Device: {device}, dtype: {dtype}")
-    print("Loading k2-fsa/OmniVoice (first run may download weights)...")
+    print(f"Loading {OMNIVOICE_MODEL!r} (first run may download weights)...")
 
     model = OmniVoice.from_pretrained(
-        "k2-fsa/OmniVoice",
+        OMNIVOICE_MODEL,
         device_map=device,
         dtype=dtype,
     )

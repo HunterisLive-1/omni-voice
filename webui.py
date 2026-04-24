@@ -1,9 +1,16 @@
-"""
-OmniVoice local Web UI — opens in your browser when you run run.bat.
+"""OmniVoice local Web UI — opens in your browser when you run run.bat.
 
-VRAM (6–8 GB GPUs): Whisper ASR auto-loads on CPU so TTS keeps GPU memory.
-  OMNIVOICE_WHISPER_DEVICE=cpu|cuda  — override auto
-  OMNIVOICE_WHISPER_AUTO_CPU_VRAM_MIB=7800  — auto-CPU below this MiB total VRAM
+Model weights:
+  Default hub id is ``k2-fsa/OmniVoice``. Override with either:
+    OMNIVOICE_MODEL_ID=...   (preferred)
+    OMNIVOICE_HUB_MODEL=...  (alias)
+  Use a Hugging Face repo id (``org/name``) or an absolute path to a folder that
+  contains ``model.safetensors`` (or ``pytorch_model.bin``) from a full download.
+
+If loading fails with "does not appear to have ... model.safetensors":
+  Often the HF cache is incomplete, or ``model.safetensors`` is a tiny Git LFS
+  pointer. Try setup.bat model re-download, or move the project to a simple path
+  (avoid emoji/special chars), or set ``HF_HOME`` / ``HF_HUB_CACHE`` to an ASCII path.
 """
 from __future__ import annotations
 
@@ -58,17 +65,23 @@ DEFAULT_PORT = int(os.environ.get("OMNIVOICE_PORT", "8765"))
 
 # Web UI “update available” banner — same repo as setup.bat / update.bat
 PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_OMNIVOICE_HUB_MODEL = "k2-fsa/OmniVoice"
 GITHUB_UPDATE_OWNER = "HunterisLive-1"
 GITHUB_UPDATE_REPO = "omni-voice"
 GITHUB_UPDATE_BRANCH = "main"
 
-# Local data: reference transcript cache (SHA256 → text) and optional design voice lock WAV.
+# Local data: optional design voice lock (saved WAV + words spoken in that clip).
 WEBUI_DATA_DIR = Path(__file__).resolve().parent / "webui_data"
 # Voice clone: user reference WAV must not exceed this (avoids long-clip / pydub issues).
 REF_AUDIO_MAX_DURATION_SEC = 15.0
 REF_MIN_WARN_SEC = 3.0
 DESIGN_LOCK_WAV = WEBUI_DATA_DIR / "design_voice_lock.wav"
-WHISPER_MODEL_FILE = WEBUI_DATA_DIR / "whisper_model.txt"
+DESIGN_LOCK_REF_TEXT = WEBUI_DATA_DIR / "design_voice_lock_ref.txt"
+REFERENCE_VOICES_JSON = WEBUI_DATA_DIR / "reference_voices.json"
+_reference_voice_json_lock = threading.Lock()
+LAST_UI_SETTINGS_JSON = WEBUI_DATA_DIR / "last_ui_settings.json"
+_last_ui_settings_lock = threading.Lock()
+_MAX_STORED_UI_TEXT = 100_000
 
 _app = Flask(__name__)
 _app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB uploads
@@ -85,7 +98,6 @@ _load_error: str | None = None
 _load_thread: threading.Thread | None = None
 _device_info: str = "detecting…"
 _omnivoice_audio_utils_patched: bool = False
-_omnivoice_whisper_device_patched: bool = False
 
 # Speaking-style presets: OmniVoice only accepts specific instruct tokens (see README).
 # We map “narrator / storyteller / …” to those tags plus decoding options (speed, steps, chunking).
@@ -313,70 +325,215 @@ def _is_hindi_language_hint(language: str | None) -> bool:
     return "hindi" in s or s in ("hi", "hin")
 
 
-def _ref_cache_path(content_hash: str) -> Path:
-    d = WEBUI_DATA_DIR / "ref_transcript_cache"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / f"{content_hash}.txt"
+def _normalize_voice_name_key(raw: str | None) -> str:
+    """Stable key for storing / matching reference transcripts (voice label or WAV stem)."""
+    if not raw:
+        return ""
+    s = raw.strip().lower()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^\w\-]+", "", s, flags=re.UNICODE)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s[:80] if s else ""
 
 
-def _ref_cache_read(content_hash: str) -> str | None:
-    p = _ref_cache_path(content_hash)
+def _load_reference_voice_book() -> dict[str, dict]:
+    """Return map key -> {transcript, last_filename, ...} for the clone page."""
+    p = REFERENCE_VOICES_JSON
     if not p.is_file():
-        return None
+        return {}
     try:
-        return p.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    voices = data.get("voices")
+    if not isinstance(voices, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for k, v in voices.items():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            continue
+        tx = v.get("transcript")
+        if isinstance(tx, str) and tx.strip():
+            entry = {"transcript": tx.strip()}
+            lf = v.get("last_filename")
+            if isinstance(lf, str) and lf:
+                entry["last_filename"] = lf
+            out[k] = entry
+    return out
 
 
-def _ref_cache_write(content_hash: str, transcript: str) -> None:
-    try:
-        _ref_cache_path(content_hash).write_text(transcript.strip(), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def _ref_cache_write_dual(raw_hash: str, proc_hash: str, transcript: str) -> None:
-    """Persist transcript under both raw and processed WAV hashes (same clip, two keys)."""
-    tx = transcript.strip()
-    if not tx:
+def _persist_reference_voice(
+    key: str, transcript: str, last_filename: str | None
+) -> None:
+    if not key or not transcript.strip():
         return
-    _ref_cache_write(raw_hash, tx)
-    if proc_hash != raw_hash:
-        _ref_cache_write(proc_hash, tx)
+    with _reference_voice_json_lock:
+        WEBUI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        p = REFERENCE_VOICES_JSON
+        book: dict = {"version": 1, "voices": {}}
+        if p.is_file():
+            try:
+                existing = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(existing.get("voices"), dict):
+                    book["voices"] = {
+                        str(kk): vv
+                        for kk, vv in existing["voices"].items()
+                        if isinstance(kk, str) and isinstance(vv, dict)
+                    }
+            except (json.JSONDecodeError, OSError):
+                pass
+        book["voices"][key] = {
+            "transcript": transcript.strip(),
+            "last_filename": (last_filename or "")[:240],
+            "updated_at": time.time(),
+        }
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(book, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(p)
 
 
-def _unload_asr_if_loaded(model) -> None:
-    """Drop Whisper pipeline so TTS can use more VRAM (e.g. RTX 3050 6 GB). Safe to call often."""
-    if getattr(model, "_asr_pipe", None) is None:
+def _reference_voice_key_from_request(
+    ref_voice_name_raw: str | None, upload_filename: str | None
+) -> str:
+    vn = (ref_voice_name_raw or "").strip()
+    if vn:
+        return _normalize_voice_name_key(vn)
+    if upload_filename:
+        return _normalize_voice_name_key(Path(upload_filename).stem)
+    return ""
+
+
+def _load_last_ui_settings() -> dict:
+    """Last saved Voice clone / Sound design form fields (``last_ui_settings.json``)."""
+    p = LAST_UI_SETTINGS_JSON
+    out: dict = {"version": 1, "clone": {}, "design": {}}
+    if not p.is_file():
+        return out
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return out
+    if not isinstance(data, dict):
+        return out
+    c = data.get("clone")
+    if isinstance(c, dict):
+        out["clone"] = dict(c)
+    d = data.get("design")
+    if isinstance(d, dict):
+        out["design"] = dict(d)
+    return out
+
+
+def _persist_last_ui_settings_branch(branch: str, snapshot: dict) -> None:
+    if branch not in ("clone", "design") or not isinstance(snapshot, dict):
         return
-    try:
-        pipe = model._asr_pipe
-        del pipe
-    except Exception:
-        pass
-    model._asr_pipe = None
-    import gc
+    with _last_ui_settings_lock:
+        p = LAST_UI_SETTINGS_JSON
+        cur: dict = {"version": 1, "clone": {}, "design": {}}
+        if p.is_file():
+            try:
+                loaded = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(loaded.get("clone"), dict):
+                    cur["clone"] = dict(loaded["clone"])
+                if isinstance(loaded.get("design"), dict):
+                    cur["design"] = dict(loaded["design"])
+            except (json.JSONDecodeError, OSError):
+                pass
+        cur[branch] = snapshot
+        WEBUI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(p) + ".tmp")
+        tmp.write_text(
+            json.dumps(cur, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(p)
 
-    gc.collect()
-    try:
-        import torch
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-    print("[OmniVoice] Whisper ASR unloaded; GPU memory freed for voice generation.", flush=True)
+def _coerce_speaking_key(raw: str | None) -> str:
+    k = (raw or "").strip()
+    return k if k in SPEAKING_STYLE_PRESETS else "default"
 
 
-def _sha256_file(path: str) -> str:
-    import hashlib
+def _coerce_quality_key(raw: str | None) -> str:
+    k = (raw or "").strip()
+    return k if k in QUALITY_PRESETS else "balanced"
 
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
+
+def _coerce_gender_ui(raw: str | None) -> str:
+    k = (raw or "").strip().lower()
+    return k if k in ("male", "female") else ""
+
+
+def _coerce_design_voice_ui(raw: str | None) -> str:
+    k = (raw or "").strip()
+    if k in DESIGN_VOICE_PROFILES:
+        return k
+    return DESIGN_VOICE_ORDER[0] if DESIGN_VOICE_ORDER else "custom"
+
+
+def _truncate_ui_str(s: str, maxlen: int) -> str:
+    if len(s) <= maxlen:
+        return s
+    return s[:maxlen]
+
+
+def _snapshot_last_clone_from_form(form, *, text: str, ref_text: str) -> dict:
+    return {
+        "ref_voice_name": _truncate_ui_str((form.get("ref_voice_name") or "").strip(), 120),
+        "ref_text": _truncate_ui_str(ref_text or "", _MAX_STORED_UI_TEXT),
+        "voice_gender": _coerce_gender_ui(form.get("voice_gender")),
+        "speaking_style": _coerce_speaking_key(form.get("speaking_style")),
+        "quality_preset": _coerce_quality_key(form.get("quality_preset")),
+        "text": _truncate_ui_str(text or "", _MAX_STORED_UI_TEXT),
+    }
+
+
+def _snapshot_last_design_from_form(form, *, text: str) -> dict:
+    return {
+        "design_voice": _coerce_design_voice_ui(form.get("design_voice")),
+        "voice_gender": _coerce_gender_ui(form.get("voice_gender")),
+        "speaking_style": _coerce_speaking_key(form.get("speaking_style")),
+        "quality_preset": _coerce_quality_key(form.get("quality_preset")),
+        "text": _truncate_ui_str(text or "", _MAX_STORED_UI_TEXT),
+        "instruct": _truncate_ui_str((form.get("instruct") or "").strip(), 2000),
+        "language": _truncate_ui_str((form.get("language") or "").strip(), 120),
+        "use_design_voice_lock": _form_checkbox_on(form.get("use_design_voice_lock")),
+        "save_design_voice_lock": _form_checkbox_on(form.get("save_design_voice_lock")),
+    }
+
+
+def _resolved_clone_defaults(raw: dict | None) -> dict:
+    """Sanitized Voice clone field defaults for the HTML form."""
+    r = raw if isinstance(raw, dict) else {}
+    d_hi = "Hello, this is a test of zero-shot voice cloning."
+    return {
+        "ref_voice_name": str(r.get("ref_voice_name") or ""),
+        "ref_text": str(r.get("ref_text") or ""),
+        "voice_gender": _coerce_gender_ui(r.get("voice_gender")),
+        "speaking_style": _coerce_speaking_key(r.get("speaking_style")),
+        "quality_preset": _coerce_quality_key(r.get("quality_preset")),
+        "text": str(r["text"]) if "text" in r else d_hi,
+    }
+
+
+def _resolved_design_defaults(raw: dict | None) -> dict:
+    """Sanitized Sound design field defaults for the HTML form."""
+    r = raw if isinstance(raw, dict) else {}
+    d_hi = "Hello, this is voice design mode without a reference recording."
+    return {
+        "design_voice": _coerce_design_voice_ui(r.get("design_voice")),
+        "voice_gender": _coerce_gender_ui(r.get("voice_gender")),
+        "speaking_style": _coerce_speaking_key(r.get("speaking_style")),
+        "quality_preset": _coerce_quality_key(r.get("quality_preset")),
+        "text": str(r["text"]) if "text" in r else d_hi,
+        "instruct": str(r.get("instruct") or ""),
+        "language": str(r.get("language") or ""),
+        "use_design_voice_lock": bool(r.get("use_design_voice_lock")),
+        "save_design_voice_lock": bool(r.get("save_design_voice_lock")),
+    }
 
 
 def _reference_wav_duration_sec(path: str) -> float | None:
@@ -424,31 +581,6 @@ def _reject_clone_reference_if_too_long(path: str) -> Response | None:
             mimetype="text/plain",
         )
     return None
-
-
-def _whisper_model_name() -> str:
-    """HF model id for reference auto-transcribe (multilingual Whisper; supports Hindi)."""
-    if WHISPER_MODEL_FILE.is_file():
-        try:
-            for line in WHISPER_MODEL_FILE.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    return line
-        except OSError:
-            pass
-    env = (os.environ.get("OMNIVOICE_WHISPER_MODEL") or "").strip()
-    if env:
-        return env
-    return "openai/whisper-large-v3-turbo"
-
-
-def _ensure_whisper_pipeline(model) -> None:
-    """Load Whisper ASR once; uses ``webui_data/whisper_model.txt`` or ``OMNIVOICE_WHISPER_MODEL``."""
-    if getattr(model, "_asr_pipe", None) is not None:
-        return
-    mid = _whisper_model_name()
-    print(f"[OmniVoice] Loading Whisper ASR: {mid}", flush=True)
-    model.load_asr_model(model_name=mid)
 
 
 def _patch_omnivoice_audio_utils() -> None:
@@ -910,76 +1042,80 @@ def _get_device_dtype():
     return "cpu", torch.float32
 
 
-def _resolve_whisper_pipeline_device(model) -> tuple[object, object]:
-    """Where to run Whisper: CPU saves ~1–2 GiB VRAM for OmniVoice TTS on 6 GB cards.
+def _omnivoice_pretrained_source() -> str:
+    """Hub repo id or local directory for :meth:`OmniVoice.from_pretrained`."""
+    for key in ("OMNIVOICE_MODEL_ID", "OMNIVOICE_HUB_MODEL"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v
+    return DEFAULT_OMNIVOICE_HUB_MODEL
 
-    Env:
-      ``OMNIVOICE_WHISPER_DEVICE`` — ``cpu`` | ``cuda`` | empty (auto).
-      ``OMNIVOICE_WHISPER_AUTO_CPU_VRAM_MIB`` — auto uses CPU when total VRAM is
-      below this many MiB (default 7800 ≈ treat 6–7 GiB cards as small).
-    """
-    import torch
 
-    env = (os.environ.get("OMNIVOICE_WHISPER_DEVICE") or "").strip().lower()
-    if env == "cpu":
-        return "cpu", torch.float32
-    if env in ("cuda", "gpu", "cuda:0"):
-        dev = getattr(model, "device", None) or (
-            "cuda:0" if torch.cuda.is_available() else "cpu"
-        )
-        dt = torch.float16 if str(dev).startswith("cuda") else torch.float32
-        return dev, dt
-
-    if not torch.cuda.is_available():
-        return "cpu", torch.float32
-
+def _is_probably_git_lfs_pointer(path: Path) -> bool:
     try:
-        mib_th = int(os.environ.get("OMNIVOICE_WHISPER_AUTO_CPU_VRAM_MIB", "7800"))
-        total_b = torch.cuda.get_device_properties(0).total_memory
-        if total_b < mib_th * 1024 * 1024:
-            tot_gib = total_b / (1024.0**3)
-            print(
-                f"[OmniVoice] GPU has ~{tot_gib:.1f} GiB VRAM (<{mib_th} MiB auto threshold) — "
-                "Whisper runs on CPU so TTS keeps GPU memory (avoids slow shared-RAM spill). "
-                "Force GPU ASR: OMNIVOICE_WHISPER_DEVICE=cuda",
-                flush=True,
+        if not path.is_file():
+            return False
+        sz = path.stat().st_size
+        if sz > 4096:
+            return False
+        head = path.read_text(encoding="utf-8", errors="ignore")[:200]
+    except OSError:
+        return False
+    return "git-lfs.github.com" in head or (
+        "version https://git-lfs" in head and "oid sha256:" in head
+    )
+
+
+def _preflight_local_omnivoice_dir(local_dir: Path) -> str | None:
+    """Return a user-facing error if a local folder cannot hold real weights."""
+    saf = local_dir / "model.safetensors"
+    pt = local_dir / "pytorch_model.bin"
+    if saf.is_file():
+        if _is_probably_git_lfs_pointer(saf):
+            return (
+                f"{saf} is a Git LFS pointer file, not downloaded weights (~2.3 GB). "
+                "Install Git LFS and pull, or run:  huggingface-cli download k2-fsa/OmniVoice "
+                "--local-dir \"C:\\path\\OmniVoice_snapshot\"  "
+                "then set OMNIVOICE_MODEL_ID to that folder."
             )
-            return "cpu", torch.float32
-    except Exception:
-        pass
+        return None
+    if pt.is_file():
+        if _is_probably_git_lfs_pointer(pt):
+            return (
+                f"{pt} is a Git LFS pointer, not real PyTorch weights. "
+                "Use a full download from Hugging Face."
+            )
+        return None
+    return (
+        f"No model.safetensors or pytorch_model.bin found in:\n  {local_dir}\n"
+        "Use a complete Hugging Face snapshot folder, or clear OMNIVOICE_MODEL_ID "
+        f"to load from the hub ({DEFAULT_OMNIVOICE_HUB_MODEL})."
+    )
 
-    dev = getattr(model, "device", "cuda:0")
-    dt = torch.float16 if str(dev).startswith("cuda") else torch.float32
-    return dev, dt
+
+def _preflight_omnivoice_model_source(model_ref: str) -> str | None:
+    p = Path(model_ref)
+    if p.is_dir():
+        return _preflight_local_omnivoice_dir(p.resolve())
+    return None
 
 
-def _patch_omnivoice_whisper_device_policy() -> None:
-    """Replace ``OmniVoice.load_asr_model`` so Whisper can use CPU on low-VRAM GPUs."""
-    global _omnivoice_whisper_device_patched
-    if _omnivoice_whisper_device_patched:
-        return
-    import logging
-
-    import torch
-    from omnivoice import OmniVoice
-
-    _log = logging.getLogger("omnivoice.models.omnivoice")
-
-    def load_asr_model(self, model_name: str = "openai/whisper-large-v3-turbo"):
-        from transformers import pipeline as hf_pipeline
-
-        dev, asr_dtype = _resolve_whisper_pipeline_device(self)
-        _log.info("Loading ASR model %s ...", model_name)
-        self._asr_pipe = hf_pipeline(
-            "automatic-speech-recognition",
-            model=model_name,
-            dtype=asr_dtype,
-            device_map=dev,
-        )
-        _log.info("ASR model loaded on %s.", dev)
-
-    OmniVoice.load_asr_model = load_asr_model  # type: ignore[method-assign]
-    _omnivoice_whisper_device_patched = True
+def _append_model_weight_troubleshooting(msg: str) -> str:
+    blob = msg.lower()
+    if "safetensors" not in blob and "pytorch_model.bin" not in blob:
+        return msg
+    return msg + (
+        "\n\n--- Common causes (hub model is fine; your copy or cache is not) ---\n"
+        "• Incomplete download: delete the cached repo under your Hugging Face hub cache "
+        "(…\\\\hub\\\\models--k2-fsa--OmniVoice or similar), then start again — or run "
+        "setup.bat and use the option to download / repair model files.\n"
+        "• Git clone without LFS: model.safetensors must be ~2.3 GB; if the file is a few "
+        "hundred bytes, it is an LFS pointer — use Git LFS or huggingface-cli download.\n"
+        "• Unusual project path (emoji, rare Unicode): move the repo to e.g. "
+        "C:\\\\dev\\\\OmniVoice or set HF_HOME to a simple ASCII path, then retry.\n"
+        "• Custom weights folder: set OMNIVOICE_MODEL_ID to the full path of a folder that "
+        "contains model.safetensors from k2-fsa/OmniVoice.\n"
+    )
 
 
 def _load_model_blocking() -> None:
@@ -994,10 +1130,17 @@ def _load_model_blocking() -> None:
             _patch_omnivoice_audio_utils()
             from omnivoice import OmniVoice
 
-            _patch_omnivoice_whisper_device_policy()
+            model_ref = _omnivoice_pretrained_source()
+            pre = _preflight_omnivoice_model_source(model_ref)
+            if pre is not None:
+                raise OSError(pre)
             device, dtype = _get_device_dtype()
+            print(
+                f"[OmniVoice] Loading model: {model_ref!r} (device={device!r})",
+                flush=True,
+            )
             _model = OmniVoice.from_pretrained(
-                "k2-fsa/OmniVoice",
+                model_ref,
                 device_map=device,
                 dtype=dtype,
             )
@@ -1006,6 +1149,7 @@ def _load_model_blocking() -> None:
             tb = traceback.format_exc()
             print(tb, file=sys.stderr, flush=True)
             msg = str(e) + "\n\n--- Traceback (full log in this console window) ---\n" + tb
+            msg = _append_model_weight_troubleshooting(msg)
             if "null bytes" in str(e).lower():
                 msg += (
                     "\n--- Fixes for null bytes (often after PC crash) ---\n"
@@ -1290,6 +1434,13 @@ PAGE_HTML = """<!DOCTYPE html>
       {% if page == 'clone' %}
       <form id="gen-form" method="post" action="/generate" enctype="multipart/form-data">
         <div class="row">
+          <label for="ref_voice_name">Voice name (optional — remember transcript)</label>
+          <input id="ref_voice_name" name="ref_voice_name" type="text" maxlength="120"
+            value="{{ ui_clone['ref_voice_name']|e }}"
+            placeholder="e.g. mom, narrator_hindi — if empty, the WAV file name is used to match" />
+          <p class="hint">After a successful run, the reference transcription is saved under this name (or the WAV’s name). Next time you pick the same name or file, the box below fills automatically — you can still edit it.</p>
+        </div>
+        <div class="row">
           <label for="ref_audio">Reference audio (WAV — short clip of the voice to clone)</label>
           <input id="ref_audio" name="ref_audio" type="file" accept=".wav,audio/wav,audio/x-wav" required />
           <p class="hint">Maximum length <strong>{{ ref_audio_max_sec|int }} seconds</strong> — longer files are not accepted (trim first). Clear speech; match the transcription below.<br />
@@ -1297,20 +1448,17 @@ PAGE_HTML = """<!DOCTYPE html>
           <p class="hint" id="ref-audio-duration-hint" aria-live="polite"></p>
         </div>
         <div class="row">
-          <label><input type="checkbox" name="auto_transcribe_ref" value="1" checked /> Auto-transcribe reference (Whisper — recommended)</label>
-          <p class="hint">Runs ASR once per WAV; the transcript is saved under <code>webui_data/ref_transcript_cache/</code> (by file hash). Same reference file again = no Whisper re-run. Paste a manual transcript below to skip ASR.</p>
-        </div>
-        <div class="row">
-          <label for="ref_text">Reference transcription (optional if auto-transcribe is on)</label>
-          <input id="ref_text" name="ref_text" type="text"
-            placeholder="Exact words in the WAV — leave empty when using auto-transcribe" />
+          <label for="ref_text">Reference transcription (required)</label>
+          <textarea id="ref_text" name="ref_text" rows="4" required
+            placeholder="Type the exact words spoken in the reference WAV (same language as the clip).">{{ ui_clone['ref_text']|e }}</textarea>
+          <p class="hint">No automatic speech recognition — paste what was said so cloning stays accurate and RAM stays low.</p>
         </div>
         <div class="row">
           <label for="voice_gender_clone">Voice gender</label>
           <select id="voice_gender_clone" name="voice_gender" aria-describedby="hint-gender-clone">
-            <option value="" selected>Unspecified</option>
-            <option value="male">Male</option>
-            <option value="female">Female</option>
+            <option value="" {% if ui_clone['voice_gender'] == '' %}selected{% endif %}>Unspecified</option>
+            <option value="male" {% if ui_clone['voice_gender'] == 'male' %}selected{% endif %}>Male</option>
+            <option value="female" {% if ui_clone['voice_gender'] == 'female' %}selected{% endif %}>Female</option>
           </select>
           <p class="hint" id="hint-gender-clone">Optional tag merged with speaking style (official model tags).</p>
         </div>
@@ -1318,7 +1466,7 @@ PAGE_HTML = """<!DOCTYPE html>
           <label for="speaking_style">Speaking style</label>
           <select id="speaking_style" name="speaking_style" aria-describedby="hint-speaking-clone">
             {% for key in speaking_keys %}
-            <option value="{{ key }}">{{ speaking_presets[key].label }}</option>
+            <option value="{{ key }}"{% if key == ui_clone['speaking_style'] %} selected{% endif %}>{{ speaking_presets[key].label }}</option>
             {% endfor %}
           </select>
           <p class="hint" id="hint-speaking-clone">Narrator, storyteller, etc. use official voice tags plus pacing — helps long lines sound more controlled.</p>
@@ -1327,7 +1475,7 @@ PAGE_HTML = """<!DOCTYPE html>
           <label for="quality_preset_clone">Generation quality</label>
           <select id="quality_preset_clone" name="quality_preset" aria-describedby="hint-quality-clone">
             {% for key in quality_keys %}
-            <option value="{{ key }}"{% if key == 'balanced' %} selected{% endif %}>{{ quality_presets[key].label }}</option>
+            <option value="{{ key }}"{% if key == ui_clone['quality_preset'] %} selected{% endif %}>{{ quality_presets[key].label }}</option>
             {% endfor %}
           </select>
           <p class="hint" id="hint-quality-clone">Speed is mostly <strong>diffusion steps</strong> (<code>num_step</code>): use <strong>Faster preview</strong> on GPUs like RTX 3050. “Balanced” = model default (32 steps). Higher quality = more steps, slower.</p>
@@ -1335,10 +1483,10 @@ PAGE_HTML = """<!DOCTYPE html>
         <div class="row">
           <label for="text">Text to speak</label>
           <textarea id="text" name="text" required
-            placeholder="Type what you want the cloned voice to say...">Hello, this is a test of zero-shot voice cloning.</textarea>
+            placeholder="Type what you want the cloned voice to say...">{{ ui_clone['text']|e }}</textarea>
         </div>
         <button type="submit" id="submit-btn" {% if load_error or not model_ready %}disabled{% endif %}>Generate speech</button>
-        <p class="hint">First generation may take longer while the model warms up. Runs on your machine only.</p>
+        <p class="hint">First generation may take longer while the model warms up. Runs on your machine only. After a successful run, choices on this tab are saved locally and restored when you open the page again.</p>
       </form>
       {% else %}
       <form id="design-form" method="post" action="/generate-design">
@@ -1346,7 +1494,7 @@ PAGE_HTML = """<!DOCTYPE html>
           <label for="design_voice">Voice character</label>
           <select id="design_voice" name="design_voice" aria-describedby="hint-design-voice">
             {% for key in design_voice_keys %}
-            <option value="{{ key }}">{{ design_voice_presets[key].label }}</option>
+            <option value="{{ key }}"{% if key == ui_design['design_voice'] %} selected{% endif %}>{{ design_voice_presets[key].label }}</option>
             {% endfor %}
           </select>
           <p class="hint" id="hint-design-voice">Pick a preset voice, or Custom to use Speaking style + gender below. Some presets already include male/female.</p>
@@ -1354,9 +1502,9 @@ PAGE_HTML = """<!DOCTYPE html>
         <div class="row">
           <label for="voice_gender_design">Voice gender</label>
           <select id="voice_gender_design" name="voice_gender" aria-describedby="hint-gender-design">
-            <option value="" selected>Unspecified</option>
-            <option value="male">Male</option>
-            <option value="female">Female</option>
+            <option value="" {% if ui_design['voice_gender'] == '' %}selected{% endif %}>Unspecified</option>
+            <option value="male" {% if ui_design['voice_gender'] == 'male' %}selected{% endif %}>Male</option>
+            <option value="female" {% if ui_design['voice_gender'] == 'female' %}selected{% endif %}>Female</option>
           </select>
           <p class="hint" id="hint-gender-design">Used when Voice character is <strong>Custom</strong> or <strong>Neutral</strong>. Ignored for fixed male/female presets to avoid tag conflicts.</p>
         </div>
@@ -1364,7 +1512,7 @@ PAGE_HTML = """<!DOCTYPE html>
           <label for="speaking_style_design">Speaking style</label>
           <select id="speaking_style_design" name="speaking_style" aria-describedby="hint-speaking-design">
             {% for key in speaking_keys %}
-            <option value="{{ key }}">{{ speaking_presets[key].label }}</option>
+            <option value="{{ key }}"{% if key == ui_design['speaking_style'] %} selected{% endif %}>{{ speaking_presets[key].label }}</option>
             {% endfor %}
           </select>
           <p class="hint" id="hint-speaking-design">Used when Voice character is <strong>Custom</strong> (narrator, excited, …). Preset voices use their own tags instead.</p>
@@ -1373,7 +1521,7 @@ PAGE_HTML = """<!DOCTYPE html>
           <label for="quality_preset_design">Generation quality</label>
           <select id="quality_preset_design" name="quality_preset" aria-describedby="hint-quality-design">
             {% for key in quality_keys %}
-            <option value="{{ key }}"{% if key == 'balanced' %} selected{% endif %}>{{ quality_presets[key].label }}</option>
+            <option value="{{ key }}"{% if key == ui_design['quality_preset'] %} selected{% endif %}>{{ quality_presets[key].label }}</option>
             {% endfor %}
           </select>
           <p class="hint" id="hint-quality-design">Use Higher quality for long paragraphs.</p>
@@ -1381,29 +1529,31 @@ PAGE_HTML = """<!DOCTYPE html>
         <div class="row">
           <label for="design-text">Text to speak</label>
           <textarea id="design-text" name="text" required rows="5"
-            placeholder="What you want spoken — any supported language.">Hello, this is voice design mode without a reference recording.</textarea>
+            placeholder="What you want spoken — any supported language.">{{ ui_design['text']|e }}</textarea>
         </div>
         <div class="row">
           <label for="instruct">Extra voice tags (optional)</label>
           <input id="instruct" name="instruct" type="text"
+            value="{{ ui_design['instruct']|e }}"
             placeholder="e.g. british accent — added on top of the speaking style" />
           <p class="hint">Official tags only (gender, age, pitch, whisper, accent…). Leave empty to use only the dropdown. Conflicting tags may error.</p>
         </div>
         <div class="row">
           <label for="language">Language (optional)</label>
-          <input id="language" name="language" type="text" placeholder="English, Hindi, en, hi — or leave empty" />
+          <input id="language" name="language" type="text" value="{{ ui_design['language']|e }}"
+            placeholder="English, Hindi, en, hi — or leave empty" />
           <p class="hint">Helps quality when set; empty uses language-agnostic mode. Hindi uses slightly slower pacing when detected.</p>
         </div>
         <div class="row">
-          <label><input type="checkbox" name="use_design_voice_lock" value="1" /> Use saved design voice (consistent timbre)</label>
-          <p class="hint">Reuses the WAV you saved below as reference audio — same character across sessions, like locking a designed voice.</p>
+          <label><input type="checkbox" name="use_design_voice_lock" value="1" {% if ui_design['use_design_voice_lock'] %}checked{% endif %} /> Use saved design voice (consistent timbre)</label>
+          <p class="hint">Reuses the WAV and the text from your last “save design voice” run as clone reference — same character across sessions.</p>
         </div>
         <div class="row">
-          <label><input type="checkbox" name="save_design_voice_lock" value="1" /> After this run, save output as my design voice</label>
-          <p class="hint">Generate once with the voice you like, check this, then later enable &quot;Use saved design voice&quot; for consistency.</p>
+          <label><input type="checkbox" name="save_design_voice_lock" value="1" {% if ui_design['save_design_voice_lock'] %}checked{% endif %} /> After this run, save output as my design voice</label>
+          <p class="hint">Saves the WAV plus this page’s “Text to speak” as the lock transcript (needed for “Use saved design voice” without Whisper).</p>
         </div>
         <button type="submit" id="submit-btn" {% if load_error or not model_ready %}disabled{% endif %}>Generate speech</button>
-        <p class="hint">No WAV upload needed — describes the voice in text instead of cloning a sample.</p>
+        <p class="hint">No WAV upload needed — describes the voice in text instead of cloning a sample. After a successful run, choices on this tab are saved locally and restored when you open the page again.</p>
       </form>
       {% endif %}
       <div id="result"></div>
@@ -1422,6 +1572,14 @@ PAGE_HTML = """<!DOCTYPE html>
     </footer>
   </div>
   <script>
+    const REF_VOICE_BOOK = {{ reference_voice_book|tojson }};
+    function normalizeVoiceKey(s) {
+      if (!s) return "";
+      let t = String(s).trim().toLowerCase().replace(/\\s+/g, "_");
+      t = t.replace(/[^\\p{L}\\p{N}_\\-]+/gu, "");
+      t = t.replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+      return t.slice(0, 80);
+    }
     const form = document.getElementById("gen-form") || document.getElementById("design-form");
     const btn = document.getElementById("submit-btn");
     const result = document.getElementById("result");
@@ -1450,7 +1608,32 @@ PAGE_HTML = """<!DOCTYPE html>
 
     const refIn = document.getElementById("ref_audio");
     const refHint = document.getElementById("ref-audio-duration-hint");
+    const refTextEl = document.getElementById("ref_text");
+    const refVoiceNameEl = document.getElementById("ref_voice_name");
     const REF_MAX = {{ ref_audio_max_sec }};
+    function applySavedReferenceTranscript(filename) {
+      if (!refTextEl || !filename) return;
+      const stem = filename.replace(/\\.[^.]+$/, "");
+      const nameVal = refVoiceNameEl && refVoiceNameEl.value ? refVoiceNameEl.value : "";
+      const kName = normalizeVoiceKey(nameVal);
+      const kFile = normalizeVoiceKey(stem);
+      const tryKeys = [];
+      if (kName) tryKeys.push(kName);
+      if (kFile && kFile !== kName) tryKeys.push(kFile);
+      if (!kName && kFile) tryKeys.push(kFile);
+      let tx = "";
+      for (let i = 0; i < tryKeys.length; i++) {
+        const e = REF_VOICE_BOOK[tryKeys[i]];
+        if (e && e.transcript) { tx = e.transcript; break; }
+      }
+      if (tx) refTextEl.value = tx;
+    }
+    if (refVoiceNameEl && refTextEl) {
+      refVoiceNameEl.addEventListener("input", function () {
+        const f = refIn && refIn.files && refIn.files[0];
+        if (f) applySavedReferenceTranscript(f.name);
+      });
+    }
     if (refIn && refHint) {
       refIn.addEventListener("change", async function () {
         refHint.textContent = "";
@@ -1462,6 +1645,7 @@ PAGE_HTML = """<!DOCTYPE html>
           const AC = window.AudioContext || window.webkitAudioContext;
           if (!AC) {
             refHint.textContent = "Cannot check length in this browser; the server will verify.";
+            applySavedReferenceTranscript(f.name);
             return;
           }
           const ctx = new AC();
@@ -1474,9 +1658,11 @@ PAGE_HTML = """<!DOCTYPE html>
             this.value = "";
           } else {
             refHint.textContent = "Duration: " + d.toFixed(1) + "s — OK (max " + REF_MAX + "s).";
+            applySavedReferenceTranscript(f.name);
           }
         } catch (_) {
           refHint.textContent = "Could not read duration in browser; the server will verify.";
+          applySavedReferenceTranscript(f.name);
         }
       });
     }
@@ -1495,6 +1681,14 @@ PAGE_HTML = """<!DOCTYPE html>
           result.innerHTML = "<div class=\\"err\\">" + (t || res.statusText) + "</div>";
           btn.disabled = false;
           return;
+        }
+        if (action === "/generate") {
+          const rt = document.getElementById("ref_text");
+          const rnm = document.getElementById("ref_voice_name");
+          const rau = document.getElementById("ref_audio");
+          const fn = (rau && rau.files && rau.files[0]) ? rau.files[0].name : "";
+          const k = normalizeVoiceKey((rnm && rnm.value.trim()) ? rnm.value : fn.replace(/\\.[^.]+$/, ""));
+          if (k && rt && rt.value.trim()) REF_VOICE_BOOK[k] = { transcript: rt.value.trim() };
         }
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -1567,6 +1761,9 @@ PAGE_HTML = """<!DOCTYPE html>
 
 def _render_ui(page: str):
     _ensure_load_started()
+    _raw_ui = _load_last_ui_settings()
+    ui_clone = _resolved_clone_defaults(_raw_ui.get("clone"))
+    ui_design = _resolved_design_defaults(_raw_ui.get("design"))
     return render_template_string(
         PAGE_HTML,
         page=page,
@@ -1581,6 +1778,9 @@ def _render_ui(page: str):
         design_voice_keys=DESIGN_VOICE_ORDER,
         design_voice_presets=DESIGN_VOICE_PROFILES,
         ref_audio_max_sec=REF_AUDIO_MAX_DURATION_SEC,
+        reference_voice_book=_load_reference_voice_book(),
+        ui_clone=ui_clone,
+        ui_design=ui_design,
     )
 
 
@@ -1776,12 +1976,13 @@ def generate():
 
     text = _normalize_chunking_text((request.form.get("text") or "").strip())
     ref_text = (request.form.get("ref_text") or "").strip()
-    auto_transcribe = _form_checkbox_on(request.form.get("auto_transcribe_ref"))
     if not text:
         return Response("Missing text to speak.", status=400, mimetype="text/plain")
-    if not auto_transcribe and not ref_text:
+    if not ref_text:
         return Response(
-            "Either enable auto-transcribe or paste the exact words spoken in the WAV.",
+            "Paste the exact words spoken in the reference WAV (required).\n"
+            "The Web UI no longer runs Whisper ASR — this saves RAM and VRAM.\n\n"
+            "रेफरेंस WAV में बोले गए शब्द यहाँ टाइप करें (ज़रूरी)।",
             status=400,
             mimetype="text/plain",
         )
@@ -1815,49 +2016,15 @@ def generate():
         pre_warnings, _dur = _preprocess_reference_wav(tmp_raw_path, tmp_proc_path, sr)
         warn_hdr.extend(pre_warnings)
 
-        raw_hash = _sha256_file(tmp_raw_path)
-        proc_hash = _sha256_file(tmp_proc_path)
-        cached_tr: str | None = None
-        if auto_transcribe:
-            cached_tr = _ref_cache_read(raw_hash) or _ref_cache_read(proc_hash)
-            if cached_tr:
-                print(
-                    "[OmniVoice] Using cached reference transcript (same WAV as a prior run).",
-                    flush=True,
-                )
-
         call_kw: dict = {**gen_kw, "text": text}
         if clone_instruct:
             call_kw["instruct"] = clone_instruct
 
-        ref_for_dur: str | None = None
+        call_kw["ref_audio"] = tmp_proc_path
+        call_kw["ref_text"] = ref_text
+        ref_for_dur = ref_text
+
         est_sec: float | None = None
-
-        if auto_transcribe and ref_text:
-            # Expert override: skip ASR but keep preprocessing/trim.
-            call_kw["ref_audio"] = tmp_proc_path
-            call_kw["ref_text"] = ref_text
-            ref_for_dur = ref_text
-        elif auto_transcribe and cached_tr:
-            call_kw["ref_audio"] = tmp_proc_path
-            call_kw["ref_text"] = cached_tr
-            ref_for_dur = cached_tr
-        elif auto_transcribe:
-            with _model_lock:
-                _ensure_whisper_pipeline(_model)
-                vcp = _model.create_voice_clone_prompt(
-                    ref_audio=tmp_proc_path,
-                    ref_text=None,
-                    preprocess_prompt=True,
-                )
-            _ref_cache_write_dual(raw_hash, proc_hash, vcp.ref_text)
-            call_kw["voice_clone_prompt"] = vcp
-            ref_for_dur = vcp.ref_text
-        else:
-            call_kw["ref_audio"] = tmp_proc_path
-            call_kw["ref_text"] = ref_text
-            ref_for_dur = ref_text
-
         if ref_for_dur:
             est_sec = _clone_target_duration_seconds(
                 _model, ref_for_dur, text, tmp_proc_path
@@ -1882,7 +2049,6 @@ def generate():
                 bar_wall_sec=wall,
             ):
                 with _model_lock:
-                    _unload_asr_if_loaded(_model)
                     audio = _model.generate(**call_kw)
         except ValueError as e:
             return Response(
@@ -1891,6 +2057,18 @@ def generate():
                 mimetype="text/plain",
             )
         wav_bytes = _audio_tensor_to_wav_bytes(_coerce_model_generate_out(audio), sr)
+        rv_key = _reference_voice_key_from_request(
+            request.form.get("ref_voice_name"),
+            ref_file.filename,
+        )
+        if rv_key:
+            _persist_reference_voice(rv_key, ref_text, ref_file.filename)
+        _persist_last_ui_settings_branch(
+            "clone",
+            _snapshot_last_clone_from_form(
+                request.form, text=text, ref_text=ref_text
+            ),
+        )
         headers = {
             "Content-Disposition": "inline; filename=omnivoice_out.wav",
         }
@@ -1926,13 +2104,34 @@ def generate_design():
 
     use_lock = _form_checkbox_on(request.form.get("use_design_voice_lock"))
     save_lock = _form_checkbox_on(request.form.get("save_design_voice_lock"))
-    if use_lock and not DESIGN_LOCK_WAV.is_file():
-        return Response(
-            "No saved design voice found. Generate once with “Save output as my design voice” checked, "
-            "then enable “Use saved design voice”.",
-            status=400,
-            mimetype="text/plain",
-        )
+    lock_ref_stored: str = ""
+    if use_lock:
+        if not DESIGN_LOCK_WAV.is_file():
+            return Response(
+                "No saved design voice WAV found. Generate once with “Save output as my design voice” checked, "
+                "then enable “Use saved design voice”.",
+                status=400,
+                mimetype="text/plain",
+            )
+        if not DESIGN_LOCK_REF_TEXT.is_file():
+            return Response(
+                "No saved design voice transcript found. This build stores the spoken text next to the lock WAV. "
+                "Generate once with “Save output as my design voice” checked (same as after updating the Web UI), "
+                "then try again.\n\n"
+                "ट्रांसक्रिप्ट फ़ाइल नहीं मिली — एक बार “Save output…” चेक करके फिर से जनरेट करें।",
+                status=400,
+                mimetype="text/plain",
+            )
+        try:
+            lock_ref_stored = DESIGN_LOCK_REF_TEXT.read_text(encoding="utf-8").strip()
+        except OSError:
+            lock_ref_stored = ""
+        if not lock_ref_stored:
+            return Response(
+                "Saved design voice transcript is empty. Generate again with “Save output as my design voice” checked.",
+                status=400,
+                mimetype="text/plain",
+            )
 
     instruct_combined = _instruct_for_design(
         request.form.get("speaking_style"),
@@ -1966,18 +2165,8 @@ def generate_design():
             tmp_proc_path = tmp_proc.name
             tmp_proc.close()
             lock_path = str(DESIGN_LOCK_WAV.resolve())
-            raw_lock_hash = _sha256_file(lock_path)
             pre_warnings, _ = _preprocess_reference_wav(lock_path, tmp_proc_path, sr)
             warn_hdr.extend(pre_warnings)
-            proc_lock_hash = _sha256_file(tmp_proc_path)
-            cached_tr = _ref_cache_read(raw_lock_hash) or _ref_cache_read(
-                proc_lock_hash
-            )
-            if cached_tr:
-                print(
-                    "[OmniVoice] Using cached design-lock reference transcript.",
-                    flush=True,
-                )
 
             call_kw: dict = {**gen_kw, "text": text}
             if instruct_combined:
@@ -1985,22 +2174,9 @@ def generate_design():
             if language:
                 call_kw["language"] = language
 
-            ref_for_dur: str | None = None
-            if cached_tr:
-                call_kw["ref_audio"] = tmp_proc_path
-                call_kw["ref_text"] = cached_tr
-                ref_for_dur = cached_tr
-            else:
-                with _model_lock:
-                    _ensure_whisper_pipeline(_model)
-                    vcp = _model.create_voice_clone_prompt(
-                        ref_audio=tmp_proc_path,
-                        ref_text=None,
-                        preprocess_prompt=True,
-                    )
-                _ref_cache_write_dual(raw_lock_hash, proc_lock_hash, vcp.ref_text)
-                call_kw["voice_clone_prompt"] = vcp
-                ref_for_dur = vcp.ref_text
+            call_kw["ref_audio"] = tmp_proc_path
+            call_kw["ref_text"] = lock_ref_stored
+            ref_for_dur = lock_ref_stored
 
             if ref_for_dur:
                 est_sec = _clone_target_duration_seconds(
@@ -2035,7 +2211,6 @@ def generate_design():
                 bar_wall_sec=wall,
             ):
                 with _model_lock:
-                    _unload_asr_if_loaded(_model)
                     audio = _model.generate(**call_kw)
         except ValueError as e:
             return Response(
@@ -2048,10 +2223,18 @@ def generate_design():
             try:
                 WEBUI_DATA_DIR.mkdir(parents=True, exist_ok=True)
                 DESIGN_LOCK_WAV.write_bytes(wav_bytes)
-                print(f"[OmniVoice] Saved design voice lock to {DESIGN_LOCK_WAV}", flush=True)
+                DESIGN_LOCK_REF_TEXT.write_text(text.strip(), encoding="utf-8")
+                print(
+                    f"[OmniVoice] Saved design voice lock to {DESIGN_LOCK_WAV} (+ transcript)",
+                    flush=True,
+                )
             except OSError as ose:
                 warn_hdr.append(f"Could not save design voice lock: {ose}")
 
+        _persist_last_ui_settings_branch(
+            "design",
+            _snapshot_last_design_from_form(request.form, text=text),
+        )
         headers = {"Content-Disposition": "inline; filename=omnivoice_design.wav"}
         if warn_hdr:
             headers["X-OmniVoice-Warn"] = " ".join(warn_hdr)[:900]
