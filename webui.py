@@ -80,7 +80,7 @@ _model_lock = threading.Lock()
 _load_error: str | None = None
 _load_thread: threading.Thread | None = None
 _device_info: str = "detecting…"
-_omnivoice_tensor_to_audiosegment_patched: bool = False
+_omnivoice_audio_utils_patched: bool = False
 
 # Speaking-style presets: OmniVoice only accepts specific instruct tokens (see README).
 # We map “narrator / storyteller / …” to those tags plus decoding options (speed, steps, chunking).
@@ -363,19 +363,20 @@ def _ensure_whisper_pipeline(model) -> None:
     model.load_asr_model(model_name=mid)
 
 
-def _patch_omnivoice_tensor_to_audiosegment() -> None:
+def _patch_omnivoice_audio_utils() -> None:
     """Work around ``'Tensor' object has no attribute 'astype'`` in omnivoice.
 
-    Upstream ``tensor_to_audiosegment`` does ``(np * scale).clip().astype``; with
-    NumPy + PyTorch ufunc interop the middle expression can stay a ``Tensor``.
-    That hits users on **CPU** when ``trim_long_audio`` runs (WebUI preprocess
-    or ``OmniVoice.generate`` for long reference audio). Not a broken pip cache.
+    Upstream ``omnivoice.utils.audio`` uses ``.astype`` after NumPy ops that can
+    return a PyTorch ``Tensor`` on some CPU stacks (NumPy↔torch ufunc interop).
+    Affected paths: ``tensor_to_audiosegment``, ``audiosegment_to_tensor``, and
+    the pydub fallback in ``load_audio``.
     """
-    global _omnivoice_tensor_to_audiosegment_patched
-    if _omnivoice_tensor_to_audiosegment_patched:
+    global _omnivoice_audio_utils_patched
+    if _omnivoice_audio_utils_patched:
         return
     import numpy as np
     import torch
+    import torchaudio
     from pydub import AudioSegment
 
     import omnivoice.utils.audio as ov_audio
@@ -383,10 +384,8 @@ def _patch_omnivoice_tensor_to_audiosegment() -> None:
     def tensor_to_audiosegment(tensor: torch.Tensor, sample_rate: int):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError("tensor_to_audiosegment expects a torch.Tensor")
-        audio_np = np.asarray(
-            tensor.detach().cpu().float().contiguous(),
-            dtype=np.float64,
-        )
+        buf = tensor.detach().cpu().float().contiguous().numpy()
+        audio_np = np.asarray(buf, dtype=np.float64)
         audio_np = np.clip(
             np.rint(audio_np * 32768.0),
             -32768,
@@ -402,15 +401,56 @@ def _patch_omnivoice_tensor_to_audiosegment() -> None:
             channels=tensor.shape[0],
         )
 
+    def audiosegment_to_tensor(aseg: AudioSegment) -> torch.Tensor:
+        raw = np.array(aseg.get_array_of_samples(), dtype=np.float64, copy=True)
+        audio_data = (raw / 32768.0).astype(np.float32)
+        if aseg.channels == 1:
+            return torch.from_numpy(audio_data).unsqueeze(0)
+        return torch.from_numpy(audio_data.reshape(-1, aseg.channels).T)
+
+    def load_audio(audio_path: str, sampling_rate: int) -> torch.Tensor:
+        try:
+            waveform, prompt_sampling_rate = torchaudio.load(
+                audio_path, backend="soundfile"
+            )
+        except (RuntimeError, OSError):
+            aseg = AudioSegment.from_file(audio_path)
+            raw = np.array(aseg.get_array_of_samples(), dtype=np.float64, copy=True)
+            audio_data = (raw / 32768.0).astype(np.float32)
+            if aseg.channels == 1:
+                waveform = torch.from_numpy(audio_data).unsqueeze(0)
+            else:
+                waveform = torch.from_numpy(
+                    audio_data.reshape(-1, aseg.channels).T
+                )
+            prompt_sampling_rate = aseg.frame_rate
+
+        if prompt_sampling_rate != sampling_rate:
+            waveform = torchaudio.functional.resample(
+                waveform,
+                orig_freq=prompt_sampling_rate,
+                new_freq=sampling_rate,
+            )
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        return waveform
+
     ov_audio.tensor_to_audiosegment = tensor_to_audiosegment  # type: ignore[method-assign]
-    _omnivoice_tensor_to_audiosegment_patched = True
+    ov_audio.audiosegment_to_tensor = audiosegment_to_tensor  # type: ignore[method-assign]
+    ov_audio.load_audio = load_audio  # type: ignore[method-assign]
+    _omnivoice_audio_utils_patched = True
+    print(
+        "[OmniVoice] Patched omnivoice.utils.audio (tensor<->pydub) for CPU NumPy/PyTorch interop.",
+        flush=True,
+    )
 
 
 def _preprocess_reference_wav(
     in_path: str, out_path: str, target_sr: int
 ) -> tuple[list[str], float]:
     """Mono, resample, trim clips longer than ~10s. Returns (warnings, duration sec)."""
-    _patch_omnivoice_tensor_to_audiosegment()
+    _patch_omnivoice_audio_utils()
     import torchaudio
     from omnivoice.utils.audio import trim_long_audio
 
@@ -696,7 +736,7 @@ class _GenProgress:
         if self._bar and self._bar > 1.0:
             bits.append(f"~{self._bar:.0f}s compute est.")
         est_str = f"  ({' · '.join(bits)})" if bits else ""
-        print(f"[OmniVoice] Generating {self._mode}…{est_str}", flush=True)
+        print(f"[OmniVoice] Generating {self._mode}...{est_str}", flush=True)
         self._thread.start()
         return self
 
@@ -765,10 +805,10 @@ def _get_device_dtype():
                 f" but torch.cuda.is_available() = False.\n"
                 f"  PyTorch was likely installed without CUDA support.\n"
                 f"  Fix: open setup.bat and pick the matching CUDA build:\n"
-                f"    driver CUDA >= 12.8  →  option 8 (CUDA 12.8)\n"
-                f"    driver CUDA >= 12.4  →  option C (CUDA 12.4)\n"
-                f"    driver CUDA >= 12.1  →  option B (CUDA 12.1)\n"
-                f"    driver CUDA >= 11.8  →  option A (CUDA 11.8)\n"
+                f"    driver CUDA >= 12.8  ->  option 8 (CUDA 12.8)\n"
+                f"    driver CUDA >= 12.4  ->  option C (CUDA 12.4)\n"
+                f"    driver CUDA >= 12.1  ->  option B (CUDA 12.1)\n"
+                f"    driver CUDA >= 11.8  ->  option A (CUDA 11.8)\n"
                 f"  Check your driver:  run  nvidia-smi  and look for 'CUDA Version'.\n",
                 flush=True,
             )
@@ -780,7 +820,7 @@ def _get_device_dtype():
         print("[OmniVoice] Running on CPU.", flush=True)
 
     print(
-        "[OmniVoice] CPU mode: float32, tensor→numpy conversion active.",
+        "[OmniVoice] CPU mode: float32, tensor-to-numpy conversion active.",
         flush=True,
     )
     return "cpu", torch.float32
@@ -795,7 +835,7 @@ def _load_model_blocking() -> None:
         if _model is not None:
             return
         try:
-            _patch_omnivoice_tensor_to_audiosegment()
+            _patch_omnivoice_audio_utils()
             from omnivoice import OmniVoice
 
             device, dtype = _get_device_dtype()
