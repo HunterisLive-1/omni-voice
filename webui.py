@@ -60,8 +60,8 @@ GITHUB_UPDATE_BRANCH = "main"
 
 # Local data: reference transcript cache (SHA256 → text) and optional design voice lock WAV.
 WEBUI_DATA_DIR = Path(__file__).resolve().parent / "webui_data"
-REF_TRIM_THRESHOLD_SEC = 10.0
-REF_TARGET_MAX_SEC = 8.0
+# Voice clone: user reference WAV must not exceed this (avoids long-clip / pydub issues).
+REF_AUDIO_MAX_DURATION_SEC = 10.0
 REF_MIN_WARN_SEC = 3.0
 DESIGN_LOCK_WAV = WEBUI_DATA_DIR / "design_voice_lock.wav"
 WHISPER_MODEL_FILE = WEBUI_DATA_DIR / "whisper_model.txt"
@@ -338,6 +338,53 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _reference_wav_duration_sec(path: str) -> float | None:
+    """Audio length in seconds (``wave`` first, then ``torchaudio``)."""
+    import wave
+
+    try:
+        with wave.open(path, "rb") as wf:
+            r = wf.getframerate()
+            n = wf.getnframes()
+            if r > 0 and n >= 0:
+                return n / float(r)
+    except (wave.Error, OSError, EOFError):
+        pass
+    try:
+        import torchaudio
+
+        w, sr = torchaudio.load(path)
+        if sr <= 0:
+            return None
+        return w.shape[-1] / float(sr)
+    except (RuntimeError, OSError):
+        return None
+
+
+def _reject_clone_reference_if_too_long(path: str) -> Response | None:
+    """Return a 400 :class:`~flask.Response` if clone reference is too long."""
+    d = _reference_wav_duration_sec(path)
+    if d is None:
+        return Response(
+            "Could not read the reference WAV duration. Use a standard PCM .wav file.\n\n"
+            "रेफरेंस WAV की लंबाई नहीं पढ़ी जा सकी — कृपया सामान्य PCM .wav उपयोग करें।",
+            status=400,
+            mimetype="text/plain",
+        )
+    if d > REF_AUDIO_MAX_DURATION_SEC:
+        lim = REF_AUDIO_MAX_DURATION_SEC
+        return Response(
+            f"Reference audio is too long ({d:.1f}s). Maximum allowed is {lim:g} seconds.\n"
+            f"This Web UI only accepts short clips so voice cloning stays reliable.\n"
+            f"Trim your WAV to {lim:g}s or less, then upload again.\n\n"
+            f"आपका रेफरेंस ऑडियो बहुत लंबा है ({d:.1f} सेकंड)। अधिकतम {lim:g} सेकंड की क्लिप अपलोड करें।\n"
+            f"छोटा WAV ट्रिम करके फिर से चुनें।",
+            status=400,
+            mimetype="text/plain",
+        )
+    return None
+
+
 def _whisper_model_name() -> str:
     """HF model id for reference auto-transcribe (multilingual Whisper; supports Hindi)."""
     if WHISPER_MODEL_FILE.is_file():
@@ -449,10 +496,13 @@ def _patch_omnivoice_audio_utils() -> None:
 def _preprocess_reference_wav(
     in_path: str, out_path: str, target_sr: int
 ) -> tuple[list[str], float]:
-    """Mono, resample, trim clips longer than ~10s. Returns (warnings, duration sec)."""
-    _patch_omnivoice_audio_utils()
+    """Mono, resample to model rate. Returns (warnings, duration sec).
+
+    Long clips are rejected at upload for voice clone (see
+    :data:`REF_AUDIO_MAX_DURATION_SEC`); we do not trim here so pydub silence
+    paths are avoided for reference preprocessing.
+    """
     import torchaudio
-    from omnivoice.utils.audio import trim_long_audio
 
     warnings: list[str] = []
     w, sr = torchaudio.load(in_path)
@@ -467,16 +517,8 @@ def _preprocess_reference_wav(
         warnings.append(
             f"Reference audio is only {dur:.1f}s; 3–10s of clear speech is recommended."
         )
-    w = trim_long_audio(
-        w,
-        target_sr,
-        max_duration=REF_TARGET_MAX_SEC,
-        min_duration=2.0,
-        trim_threshold=REF_TRIM_THRESHOLD_SEC,
-    )
     torchaudio.save(out_path, w, target_sr)
-    new_dur = w.shape[1] / float(target_sr)
-    return warnings, new_dur
+    return warnings, dur
 
 
 def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path: str) -> float | None:
@@ -1135,7 +1177,9 @@ PAGE_HTML = """<!DOCTYPE html>
         <div class="row">
           <label for="ref_audio">Reference audio (WAV — short clip of the voice to clone)</label>
           <input id="ref_audio" name="ref_audio" type="file" accept=".wav,audio/wav,audio/x-wav" required />
-          <p class="hint">Use a clear recording; match the transcription below.</p>
+          <p class="hint">Maximum length <strong>{{ ref_audio_max_sec|int }} seconds</strong> — longer files are not accepted (trim first). Clear speech; match the transcription below.<br />
+            <span lang="hi">अधिकतम {{ ref_audio_max_sec|int }} सेकंड — इससे लंबी फ़ाइल स्वीकार नहीं; पहले ट्रिम करें।</span></p>
+          <p class="hint" id="ref-audio-duration-hint" aria-live="polite"></p>
         </div>
         <div class="row">
           <label><input type="checkbox" name="auto_transcribe_ref" value="1" checked /> Auto-transcribe reference (Whisper — recommended)</label>
@@ -1289,6 +1333,39 @@ PAGE_HTML = """<!DOCTYPE html>
     }
     if (loaderCard) setInterval(pollStatus, 2000);
 
+    const refIn = document.getElementById("ref_audio");
+    const refHint = document.getElementById("ref-audio-duration-hint");
+    const REF_MAX = {{ ref_audio_max_sec }};
+    if (refIn && refHint) {
+      refIn.addEventListener("change", async function () {
+        refHint.textContent = "";
+        refHint.className = "hint";
+        const f = this.files && this.files[0];
+        if (!f) return;
+        try {
+          const buf = await f.arrayBuffer();
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) {
+            refHint.textContent = "Cannot check length in this browser; the server will verify.";
+            return;
+          }
+          const ctx = new AC();
+          const audioBuf = await ctx.decodeAudioData(buf.slice(0));
+          ctx.close();
+          const d = audioBuf.duration;
+          if (d > REF_MAX + 0.05) {
+            refHint.className = "hint err";
+            refHint.innerHTML = "Not accepted: " + d.toFixed(1) + "s (max " + REF_MAX + "s). Trim the WAV and choose again. / स्वीकार नहीं: अधिकतम " + REF_MAX + " सेकंड।";
+            this.value = "";
+          } else {
+            refHint.textContent = "Duration: " + d.toFixed(1) + "s — OK (max " + REF_MAX + "s).";
+          }
+        } catch (_) {
+          refHint.textContent = "Could not read duration in browser; the server will verify.";
+        }
+      });
+    }
+
     if (form) form.addEventListener("submit", async (e) => {
       e.preventDefault();
       if (btn.disabled) return;
@@ -1388,6 +1465,7 @@ def _render_ui(page: str):
         quality_presets=QUALITY_PRESETS,
         design_voice_keys=DESIGN_VOICE_ORDER,
         design_voice_presets=DESIGN_VOICE_PROFILES,
+        ref_audio_max_sec=REF_AUDIO_MAX_DURATION_SEC,
     )
 
 
@@ -1615,6 +1693,9 @@ def generate():
 
     try:
         ref_file.save(tmp_raw_path)
+        reject = _reject_clone_reference_if_too_long(tmp_raw_path)
+        if reject is not None:
+            return reject
         sr = int(getattr(_model, "sampling_rate", None) or 24000)
         pre_warnings, _dur = _preprocess_reference_wav(tmp_raw_path, tmp_proc_path, sr)
         warn_hdr.extend(pre_warnings)
