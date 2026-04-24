@@ -46,8 +46,7 @@ REM -- 4) All good: start the Web UI -------------------------------------
 echo.
 echo   Starting OmniVoice Web UI...
 echo   Browser will open at http://127.0.0.1:8765
-echo   GPU loads the model on first Generate (saves VRAM while idle).
-echo   For load-at-startup: set OMNIVOICE_EAGER_MODEL_LOAD=1 before run.bat
+echo   GPU loads the model only after you press Generate speech (not before).
 echo   (first download can take 5 to 30 minutes)
 echo.
 echo   Press Ctrl+C to stop the server.

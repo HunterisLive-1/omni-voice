@@ -29,9 +29,6 @@ REM    setup.bat run          Start Web UI (same as run.bat)
 REM    setup.bat verify | fixhttpx | fixaccelerate | deeprepair | repairomni
 REM    setup.bat torchcu128 | torchcu124 | torchcu121 | torchcu118 | torchcpu
 REM    setup.bat weights      Pre-download Hugging Face model files
-REM    setup.bat whisper      Whisper ASR menu ^(model for Hindi / auto-transcribe^)
-REM    setup.bat whisperinstall   pip install ASR helpers ^(soundfile, hub^)
-REM    setup.bat whisperdownload  Pre-download selected Whisper weights
 REM    setup.bat update       Pull latest from GitHub ^(clone or ZIP - auto git init + origin^)
 REM
 REM  Non-tech users: double-click  update.bat  in this folder  -- same as setup.bat update
@@ -53,9 +50,6 @@ if /i "%~1"=="torchcu124" goto :reinstall_torch_cu124_cli
 if /i "%~1"=="torchcu121" goto :reinstall_torch_cu121_cli
 if /i "%~1"=="torchcu118" goto :reinstall_torch_cu118_cli
 if /i "%~1"=="torchcpu" goto :reinstall_torch_cpu_cli
-if /i "%~1"=="whisper" goto :whisper_from_cli
-if /i "%~1"=="whisperinstall" goto :whisper_install_cli
-if /i "%~1"=="whisperdownload" goto :whisper_download_cli
 if /i "%~1"=="update" goto :update_repo_cli
 
 REM ---- No args: fully automatic flow ----
@@ -96,12 +90,11 @@ echo  A  Reinstall PyTorch CUDA 11.8  ^(driver ^>= 452, older GTX/RTX cards^)
 echo  B  Reinstall PyTorch CUDA 12.1  ^(driver ^>= 530^)
 echo  C  Reinstall PyTorch CUDA 12.4  ^(driver ^>= 550, RTX 30/40 series^)
 echo  D  Download / update model weights from Hugging Face ^(large download^)
-echo  E  Whisper ASR ^(auto-transcribe ref WAV^) - model, install, Hindi-friendly presets
 echo  U  Update project from GitHub ^(git pull - ZIP gets auto-linked on first run^)
 echo  0  Exit
 echo ========================================
 set "CH="
-set /p CH="Enter choice [0-9, D, E, or U]: "
+set /p CH="Enter choice [0-9, D, or U]: "
 if "%CH%"=="1" goto :install
 if "%CH%"=="2" goto :run
 if "%CH%"=="3" (
@@ -187,12 +180,6 @@ if /i "%CH%"=="d" (
   call :download_weights_body
   pause
   goto :menu
-)
-if /i "%CH%"=="e" (
-  set "WHISPER_FROM_CLI="
-  call :need_venv
-  if errorlevel 1 ( pause & goto :menu )
-  goto :whisper_menu
 )
 if /i "%CH%"=="u" (
   call :update_repo_body
@@ -354,126 +341,6 @@ call :update_repo_body
 set "URE=!ERRORLEVEL!"
 pause
 exit /b !URE!
-
-REM ===========================================================================
-:whisper_from_cli
-set "WHISPER_FROM_CLI=1"
-call :need_venv
-if errorlevel 1 ( pause & exit /b 1 )
-goto :whisper_menu
-
-:whisper_menu
-cls
-echo.
-echo ========================================
-echo  Whisper ASR  - Web UI reference auto-transcribe
-echo ========================================
-echo  All OpenAI Whisper checkpoints on Hugging Face are multilingual ^(Hindi + 90+ langs^).
-echo  Config file: %~dp0webui_data\whisper_model.txt
-echo  Env override ^(optional^): OMNIVOICE_WHISPER_MODEL
-echo  After changing model: restart run.bat
-echo.
-echo  1  Recommended: openai/whisper-large-v3-turbo ^(default  - fast, good Hindi^)
-echo  2  Higher quality: openai/whisper-large-v3 ^(slower, heavier VRAM^)
-echo  3  Balanced: openai/whisper-medium
-echo  4  Lighter GPU / less RAM: openai/whisper-small
-echo  5  CPU or very low VRAM: openai/whisper-base
-echo  6  Custom  - type any Hugging Face model id
-echo  7  Pre-download current model ^(saves time on first Web UI use^)
-echo  8  Show current model id
-echo  9  Install / upgrade ASR pip packages ^(soundfile, huggingface_hub, transformers^)
-echo  0  Back
-echo ========================================
-set "WCH="
-set /p WCH="Enter choice [0-9]: "
-if "%WCH%"=="1" (
-  "%VPY%" "%~dp0whisper_config_tool.py" save openai/whisper-large-v3-turbo
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="2" (
-  "%VPY%" "%~dp0whisper_config_tool.py" save openai/whisper-large-v3
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="3" (
-  "%VPY%" "%~dp0whisper_config_tool.py" save openai/whisper-medium
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="4" (
-  "%VPY%" "%~dp0whisper_config_tool.py" save openai/whisper-small
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="5" (
-  "%VPY%" "%~dp0whisper_config_tool.py" save openai/whisper-base
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="6" (
-  set "WCUST="
-  set /p WCUST="Hugging Face model id ^(e.g. distil-whisper/distil-large-v3^): "
-  if "!WCUST!"=="" (
-    echo Cancelled.
-  ) else (
-    "%VPY%" "%~dp0whisper_config_tool.py" save "!WCUST!"
-  )
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="7" (
-  call :whisper_download_body
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="8" (
-  echo.
-  "%VPY%" "%~dp0whisper_config_tool.py" show
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="9" (
-  call :whisper_install_body
-  goto :whisper_menu_pause
-)
-if "%WCH%"=="0" (
-  if defined WHISPER_FROM_CLI (
-    set "WHISPER_FROM_CLI="
-    exit /b 0
-  )
-  goto :menu
-)
-echo Invalid choice.
-:whisper_menu_pause
-echo.
-pause
-goto :whisper_menu
-
-:whisper_install_body
-echo.
-echo === Whisper / ASR pip packages ===
-call "%VENV_DIR%\Scripts\activate.bat"
-python -m pip install --upgrade soundfile "transformers>=5.3" huggingface_hub "accelerate>=1.0"
-if errorlevel 1 exit /b 1
-echo OK.
-exit /b 0
-
-:whisper_install_cli
-call :need_venv
-if errorlevel 1 ( pause & exit /b 1 )
-call :whisper_install_body
-set "WIE=!ERRORLEVEL!"
-pause
-exit /b !WIE!
-
-:whisper_download_body
-echo.
-echo === Pre-download Whisper weights ^(current webui_data\whisper_model.txt^) ===
-call "%VENV_DIR%\Scripts\activate.bat"
-"%VPY%" "%~dp0whisper_config_tool.py" download
-if errorlevel 1 exit /b 1
-exit /b 0
-
-:whisper_download_cli
-call :need_venv
-if errorlevel 1 ( pause & exit /b 1 )
-call :whisper_download_body
-set "WDE=!ERRORLEVEL!"
-pause
-exit /b !WDE!
 
 REM ===========================================================================
 :download_weights_body
@@ -974,11 +841,6 @@ if errorlevel 1 (
 echo   OK: OmniVoice and Flask installed.
 echo.
 
-if not exist "%~dp0webui_data\whisper_model.txt" (
-  echo   Default Whisper model for auto-transcribe: openai/whisper-large-v3-turbo ^(multilingual / Hindi^)
-  "%VPY%" "%~dp0whisper_config_tool.py" save openai/whisper-large-v3-turbo
-)
-
 REM -----------------------------------------------------------------
 echo   [Step 6 of 6]  Downloading OmniVoice model weights ^(~2.5 GB^)...
 echo                  ^(saves to %%USERPROFILE%%\.cache\huggingface\hub^)
@@ -996,7 +858,6 @@ echo.
 echo ================================================================
 echo   All done! OmniVoice is ready to use.
 echo ================================================================
-echo   Whisper auto-transcribe:  setup.bat menu ^> E  or  setup.bat whisper
 echo   Update from GitHub:  setup.bat menu ^> U  or  setup.bat update ^(ZIP links automatically^)
 echo.
 
@@ -1039,7 +900,7 @@ echo Starting Web UI with:
 echo   %VPY%
 echo   %~dp0webui.py
 echo.
-echo GPU: model loads on first Generate by default (idle VRAM low). Eager load: OMNIVOICE_EAGER_MODEL_LOAD=1
+echo GPU: model loads only when you press Generate in the browser (not at server start).
 echo.
 echo If this window closes instantly, open cmd here and run: setup.bat install
 echo.
