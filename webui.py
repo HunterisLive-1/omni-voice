@@ -129,17 +129,20 @@ SPEAKING_STYLE_PRESETS: dict[str, dict] = {
     },
 }
 
+# ``num_step`` = diffusion steps (default in omnivoice is 32). Official README:
+# use 16 for faster inference; RTF ~0.025 in papers is H20 + batch infer — not a
+# single RTX 3050 request. See https://github.com/k2-fsa/OmniVoice/issues/7
 QUALITY_PRESETS: dict[str, dict] = {
     "fast": {
-        "label": "Faster preview (shorter decode)",
+        "label": "Faster preview (recommended on 6 GB GPUs)",
         "gen": {
-            "num_step": 24,
+            "num_step": 16,
             "audio_chunk_duration": 18.0,
             "audio_chunk_threshold": 40.0,
         },
     },
     "balanced": {
-        "label": "Balanced",
+        "label": "Balanced (default 32 steps)",
         "gen": {},
     },
     "high": {
@@ -569,12 +572,10 @@ def _wall_clock_estimate_for_progress(
         return None
     p = float(predicted_output_sec)
     di = (device_info or "").lower()
-    # Playback length p is not wall time: the decoder runs many steps per second of
-    # audio. These multipliers are rough budgets for the *terminal progress bar only*.
     if "cpu" in di and "cuda" not in di:
-        mult = 22.0  # often many minutes for tens of seconds of output
+        mult = 22.0
     else:
-        mult = 5.0  # GPU: typically a few × realtime; was 6 (more pessimistic)
+        mult = 6.0
     w = max(40.0, p * mult)
     return min(w, 1200.0)
 
@@ -778,7 +779,7 @@ class _GenProgress:
         if self._out and self._out > 0.1:
             bits.append(f"audio ~{self._out:.0f}s out")
         if self._bar and self._bar > 1.0:
-            bits.append(f"~{self._bar:.0f}s decode (wall est., not audio length)")
+            bits.append(f"~{self._bar:.0f}s compute est.")
         est_str = f"  ({' · '.join(bits)})" if bits else ""
         print(f"[OmniVoice] Generating {self._mode}...{est_str}", flush=True)
         self._thread.start()
@@ -1217,7 +1218,7 @@ PAGE_HTML = """<!DOCTYPE html>
             <option value="{{ key }}"{% if key == 'balanced' %} selected{% endif %}>{{ quality_presets[key].label }}</option>
             {% endfor %}
           </select>
-          <p class="hint" id="hint-quality-clone">Higher quality uses more steps and smaller audio chunks (better for long text, slower).</p>
+          <p class="hint" id="hint-quality-clone">Speed is mostly <strong>diffusion steps</strong> (<code>num_step</code>): use <strong>Faster preview</strong> on GPUs like RTX 3050. “Balanced” = model default (32 steps). Higher quality = more steps, slower.</p>
         </div>
         <div class="row">
           <label for="text">Text to speak</label>
