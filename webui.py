@@ -569,10 +569,12 @@ def _wall_clock_estimate_for_progress(
         return None
     p = float(predicted_output_sec)
     di = (device_info or "").lower()
+    # Playback length p is not wall time: the decoder runs many steps per second of
+    # audio. These multipliers are rough budgets for the *terminal progress bar only*.
     if "cpu" in di and "cuda" not in di:
-        mult = 22.0
+        mult = 22.0  # often many minutes for tens of seconds of output
     else:
-        mult = 6.0
+        mult = 5.0  # GPU: typically a few × realtime; was 6 (more pessimistic)
     w = max(40.0, p * mult)
     return min(w, 1200.0)
 
@@ -776,7 +778,7 @@ class _GenProgress:
         if self._out and self._out > 0.1:
             bits.append(f"audio ~{self._out:.0f}s out")
         if self._bar and self._bar > 1.0:
-            bits.append(f"~{self._bar:.0f}s compute est.")
+            bits.append(f"~{self._bar:.0f}s decode (wall est., not audio length)")
         est_str = f"  ({' · '.join(bits)})" if bits else ""
         print(f"[OmniVoice] Generating {self._mode}...{est_str}", flush=True)
         self._thread.start()
