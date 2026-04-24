@@ -331,6 +331,39 @@ def _ref_cache_write(content_hash: str, transcript: str) -> None:
         pass
 
 
+def _ref_cache_write_dual(raw_hash: str, proc_hash: str, transcript: str) -> None:
+    """Persist transcript under both raw and processed WAV hashes (same clip, two keys)."""
+    tx = transcript.strip()
+    if not tx:
+        return
+    _ref_cache_write(raw_hash, tx)
+    if proc_hash != raw_hash:
+        _ref_cache_write(proc_hash, tx)
+
+
+def _unload_asr_if_loaded(model) -> None:
+    """Drop Whisper pipeline so TTS can use more VRAM (e.g. RTX 3050 6 GB). Safe to call often."""
+    if getattr(model, "_asr_pipe", None) is None:
+        return
+    try:
+        pipe = model._asr_pipe
+        del pipe
+    except Exception:
+        pass
+    model._asr_pipe = None
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print("[OmniVoice] Whisper ASR unloaded; GPU memory freed for voice generation.", flush=True)
+
+
 def _sha256_file(path: str) -> str:
     import hashlib
 
@@ -560,14 +593,12 @@ def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path
 
 
 def _wall_clock_estimate_for_progress(
-    predicted_output_sec: float | None, device_info: str
+    predicted_output_sec: float | None,
+    device_info: str,
+    *,
+    num_step: int | None = None,
 ) -> float | None:
-    """Turn predicted *WAV length* (sec) into a rough *real time* to finish generation.
-
-    The model's ``duration`` is audio length, not RTX/CPU time — the old code used
-    the same value for the terminal bar, so 0–99% finished in ~audio-length
-    seconds while actual decode could be 5–10× longer on GPU (and more on CPU).
-    """
+    """Turn predicted *WAV length* (sec) into a rough wall time for the progress bar."""
     if predicted_output_sec is None or predicted_output_sec < 0.05:
         return None
     p = float(predicted_output_sec)
@@ -577,6 +608,9 @@ def _wall_clock_estimate_for_progress(
     else:
         mult = 6.0
     w = max(40.0, p * mult)
+    ns = int(num_step) if num_step is not None else 32
+    if ns > 0:
+        w *= float(ns) / 32.0
     return min(w, 1200.0)
 
 
@@ -1186,7 +1220,7 @@ PAGE_HTML = """<!DOCTYPE html>
         </div>
         <div class="row">
           <label><input type="checkbox" name="auto_transcribe_ref" value="1" checked /> Auto-transcribe reference (Whisper — recommended)</label>
-          <p class="hint">Runs ASR on your WAV (cached by clip hash) so reference text matches the audio. Paste a manual transcript below to skip ASR. First ASR run may download Whisper.</p>
+          <p class="hint">Runs ASR once per WAV; the transcript is saved under <code>webui_data/ref_transcript_cache/</code> (by file hash). Same reference file again = no Whisper re-run. Paste a manual transcript below to skip ASR.</p>
         </div>
         <div class="row">
           <label for="ref_text">Reference transcription (optional if auto-transcribe is on)</label>
@@ -1703,8 +1737,16 @@ def generate():
         pre_warnings, _dur = _preprocess_reference_wav(tmp_raw_path, tmp_proc_path, sr)
         warn_hdr.extend(pre_warnings)
 
-        content_hash = _sha256_file(tmp_proc_path)
-        cached_tr = _ref_cache_read(content_hash) if auto_transcribe else None
+        raw_hash = _sha256_file(tmp_raw_path)
+        proc_hash = _sha256_file(tmp_proc_path)
+        cached_tr: str | None = None
+        if auto_transcribe:
+            cached_tr = _ref_cache_read(raw_hash) or _ref_cache_read(proc_hash)
+            if cached_tr:
+                print(
+                    "[OmniVoice] Using cached reference transcript (same WAV as a prior run).",
+                    flush=True,
+                )
 
         call_kw: dict = {**gen_kw, "text": text}
         if clone_instruct:
@@ -1730,7 +1772,7 @@ def generate():
                     ref_text=None,
                     preprocess_prompt=True,
                 )
-            _ref_cache_write(content_hash, vcp.ref_text)
+            _ref_cache_write_dual(raw_hash, proc_hash, vcp.ref_text)
             call_kw["voice_clone_prompt"] = vcp
             ref_for_dur = vcp.ref_text
         else:
@@ -1751,7 +1793,10 @@ def generate():
 
         preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
         print(f'[OmniVoice] Text: "{preview}"', flush=True)
-        wall = _wall_clock_estimate_for_progress(est_sec, _device_info)
+        _ns_est = int(gen_kw.get("num_step") or 32)
+        wall = _wall_clock_estimate_for_progress(
+            est_sec, _device_info, num_step=_ns_est
+        )
         try:
             with _GenProgress(
                 "Voice Clone",
@@ -1759,6 +1804,7 @@ def generate():
                 bar_wall_sec=wall,
             ):
                 with _model_lock:
+                    _unload_asr_if_loaded(_model)
                     audio = _model.generate(**call_kw)
         except ValueError as e:
             return Response(
@@ -1841,12 +1887,19 @@ def generate_design():
             tmp_proc = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
             tmp_proc_path = tmp_proc.name
             tmp_proc.close()
-            pre_warnings, _ = _preprocess_reference_wav(
-                str(DESIGN_LOCK_WAV.resolve()), tmp_proc_path, sr
-            )
+            lock_path = str(DESIGN_LOCK_WAV.resolve())
+            raw_lock_hash = _sha256_file(lock_path)
+            pre_warnings, _ = _preprocess_reference_wav(lock_path, tmp_proc_path, sr)
             warn_hdr.extend(pre_warnings)
-            content_hash = _sha256_file(tmp_proc_path)
-            cached_tr = _ref_cache_read(content_hash)
+            proc_lock_hash = _sha256_file(tmp_proc_path)
+            cached_tr = _ref_cache_read(raw_lock_hash) or _ref_cache_read(
+                proc_lock_hash
+            )
+            if cached_tr:
+                print(
+                    "[OmniVoice] Using cached design-lock reference transcript.",
+                    flush=True,
+                )
 
             call_kw: dict = {**gen_kw, "text": text}
             if instruct_combined:
@@ -1867,7 +1920,7 @@ def generate_design():
                         ref_text=None,
                         preprocess_prompt=True,
                     )
-                _ref_cache_write(content_hash, vcp.ref_text)
+                _ref_cache_write_dual(raw_lock_hash, proc_lock_hash, vcp.ref_text)
                 call_kw["voice_clone_prompt"] = vcp
                 ref_for_dur = vcp.ref_text
 
@@ -1893,7 +1946,10 @@ def generate_design():
         preview = text[:70].replace("\n", " ") + ("…" if len(text) > 70 else "")
         print(f'[OmniVoice] Text: "{preview}"', flush=True)
         label = "Voice Design (locked ref)" if use_lock else "Voice Design"
-        wall = _wall_clock_estimate_for_progress(est_sec, _device_info)
+        _ns_d = int(gen_kw.get("num_step") or 32)
+        wall = _wall_clock_estimate_for_progress(
+            est_sec, _device_info, num_step=_ns_d
+        )
         try:
             with _GenProgress(
                 label,
@@ -1901,6 +1957,7 @@ def generate_design():
                 bar_wall_sec=wall,
             ):
                 with _model_lock:
+                    _unload_asr_if_loaded(_model)
                     audio = _model.generate(**call_kw)
         except ValueError as e:
             return Response(
