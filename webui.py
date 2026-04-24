@@ -1,5 +1,9 @@
 """
 OmniVoice local Web UI — opens in your browser when you run run.bat.
+
+VRAM (6–8 GB GPUs): Whisper ASR auto-loads on CPU so TTS keeps GPU memory.
+  OMNIVOICE_WHISPER_DEVICE=cpu|cuda  — override auto
+  OMNIVOICE_WHISPER_AUTO_CPU_VRAM_MIB=7800  — auto-CPU below this MiB total VRAM
 """
 from __future__ import annotations
 
@@ -81,6 +85,7 @@ _load_error: str | None = None
 _load_thread: threading.Thread | None = None
 _device_info: str = "detecting…"
 _omnivoice_audio_utils_patched: bool = False
+_omnivoice_whisper_device_patched: bool = False
 
 # Speaking-style presets: OmniVoice only accepts specific instruct tokens (see README).
 # We map “narrator / storyteller / …” to those tags plus decoding options (speed, steps, chunking).
@@ -905,6 +910,78 @@ def _get_device_dtype():
     return "cpu", torch.float32
 
 
+def _resolve_whisper_pipeline_device(model) -> tuple[object, object]:
+    """Where to run Whisper: CPU saves ~1–2 GiB VRAM for OmniVoice TTS on 6 GB cards.
+
+    Env:
+      ``OMNIVOICE_WHISPER_DEVICE`` — ``cpu`` | ``cuda`` | empty (auto).
+      ``OMNIVOICE_WHISPER_AUTO_CPU_VRAM_MIB`` — auto uses CPU when total VRAM is
+      below this many MiB (default 7800 ≈ treat 6–7 GiB cards as small).
+    """
+    import torch
+
+    env = (os.environ.get("OMNIVOICE_WHISPER_DEVICE") or "").strip().lower()
+    if env == "cpu":
+        return "cpu", torch.float32
+    if env in ("cuda", "gpu", "cuda:0"):
+        dev = getattr(model, "device", None) or (
+            "cuda:0" if torch.cuda.is_available() else "cpu"
+        )
+        dt = torch.float16 if str(dev).startswith("cuda") else torch.float32
+        return dev, dt
+
+    if not torch.cuda.is_available():
+        return "cpu", torch.float32
+
+    try:
+        mib_th = int(os.environ.get("OMNIVOICE_WHISPER_AUTO_CPU_VRAM_MIB", "7800"))
+        total_b = torch.cuda.get_device_properties(0).total_memory
+        if total_b < mib_th * 1024 * 1024:
+            tot_gib = total_b / (1024.0**3)
+            print(
+                f"[OmniVoice] GPU has ~{tot_gib:.1f} GiB VRAM (<{mib_th} MiB auto threshold) — "
+                "Whisper runs on CPU so TTS keeps GPU memory (avoids slow shared-RAM spill). "
+                "Force GPU ASR: OMNIVOICE_WHISPER_DEVICE=cuda",
+                flush=True,
+            )
+            return "cpu", torch.float32
+    except Exception:
+        pass
+
+    dev = getattr(model, "device", "cuda:0")
+    dt = torch.float16 if str(dev).startswith("cuda") else torch.float32
+    return dev, dt
+
+
+def _patch_omnivoice_whisper_device_policy() -> None:
+    """Replace ``OmniVoice.load_asr_model`` so Whisper can use CPU on low-VRAM GPUs."""
+    global _omnivoice_whisper_device_patched
+    if _omnivoice_whisper_device_patched:
+        return
+    import logging
+
+    import torch
+    from omnivoice import OmniVoice
+
+    _log = logging.getLogger("omnivoice.models.omnivoice")
+
+    def load_asr_model(self, model_name: str = "openai/whisper-large-v3-turbo"):
+        from transformers import pipeline as hf_pipeline
+
+        dev, asr_dtype = _resolve_whisper_pipeline_device(self)
+        _log.info("Loading ASR model %s ...", model_name)
+        self._asr_pipe = hf_pipeline(
+            "automatic-speech-recognition",
+            model=model_name,
+            dtype=asr_dtype,
+            device_map=dev,
+        )
+        _log.info("ASR model loaded on %s.", dev)
+
+    OmniVoice.load_asr_model = load_asr_model  # type: ignore[method-assign]
+    _omnivoice_whisper_device_patched = True
+
+
 def _load_model_blocking() -> None:
     """Load weights once (runs in background thread)."""
     global _model, _load_error
@@ -917,6 +994,7 @@ def _load_model_blocking() -> None:
             _patch_omnivoice_audio_utils()
             from omnivoice import OmniVoice
 
+            _patch_omnivoice_whisper_device_policy()
             device, dtype = _get_device_dtype()
             _model = OmniVoice.from_pretrained(
                 "k2-fsa/OmniVoice",
