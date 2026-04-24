@@ -151,8 +151,8 @@ SPEAKING_STYLE_PRESETS: dict[str, dict] = {
 }
 
 # ``num_step`` = diffusion steps (default in omnivoice is 32). Official README:
-# use 16 for faster inference; RTF ~0.025 in papers is H20 + batch infer — not a
-# single RTX 3050 request. See https://github.com/k2-fsa/OmniVoice/issues/7
+# use 16 for faster inference; paper RTF numbers are not single-request desktop GPU.
+# Terminal “compute est.” uses ~1.1× predicted WAV length on CUDA (see ``_wall_clock_estimate_for_progress``).
 QUALITY_PRESETS: dict[str, dict] = {
     "fast": {
         "label": "Faster preview (recommended on 6 GB GPUs)",
@@ -739,16 +739,25 @@ def _wall_clock_estimate_for_progress(
     *,
     num_step: int | None = None,
 ) -> float | None:
-    """Turn predicted *WAV length* (sec) into a rough wall time for the progress bar."""
+    """Turn predicted *WAV length* (sec) into a rough wall time for the progress bar.
+
+    Mid-range NVIDIA GPUs (e.g. RTX 3050) often run near **~1× realtime** vs. predicted
+    duration for a single ``generate()`` call — the old 6× factor was far too pessimistic.
+    CPU remains a multiple of audio length (much slower than realtime).
+    """
     if predicted_output_sec is None or predicted_output_sec < 0.05:
         return None
     p = float(predicted_output_sec)
     di = (device_info or "").lower()
+    # Pure CPU (no CUDA in this process): decode is far slower than realtime.
     if "cpu" in di and "cuda" not in di:
-        mult = 22.0
+        mult = 16.0
+        floor = 20.0
     else:
-        mult = 6.0
-    w = max(40.0, p * mult)
+        # CUDA, MPS, or unknown accelerator: ~1× predicted audio with small headroom.
+        mult = 1.12
+        floor = 6.0
+    w = max(floor, p * mult)
     ns = int(num_step) if num_step is not None else 32
     if ns > 0:
         w *= float(ns) / 32.0
@@ -923,8 +932,8 @@ class _GenProgress:
     """Live terminal progress bar while model.generate() runs.
 
     * ``output_sec`` = model's predicted *audio* length (same idea as generate duration).
-    * ``bar_wall_sec`` = rough *wall-clock* budget for the bar (decode is much slower
-      than real-time; do not use output_sec for the bar).
+    * ``bar_wall_sec`` = rough *wall-clock* budget for the bar (on many GPUs ~1× the
+      predicted audio length; CPU is much slower — do not use ``output_sec`` alone unscaled).
 
     Usage::
         with _GenProgress("Voice Clone", output_sec=22.0, bar_wall_sec=130.0):
