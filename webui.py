@@ -531,6 +531,47 @@ def _coerce_model_generate_out(gout) -> object:
     return _unwrap_single_container(o)
 
 
+def _coerce_wav_float_numpy(audio) -> "np.ndarray":
+    """Force model output to 1D float32 :class:`numpy.ndarray` in ~[-1, 1].
+
+    Some Windows CPU stacks leave a :class:`torch.Tensor` after ``np.asarray`` (no
+    ``__array__`` / NumPy dispatch), which then makes ``(arr * …).astype(…)`` fail
+    with ``'Tensor' object has no attribute 'astype'``.
+    """
+    import numpy as np
+
+    arr: object = _to_numpy_mono_1d(audio)
+    for _ in range(8):
+        if (
+            isinstance(arr, np.ndarray)
+            and arr.dtype != np.dtype("O")
+            and np.issubdtype(arr.dtype, np.number)
+        ):
+            out = np.ascontiguousarray(arr, dtype=np.float32).ravel()
+            np.clip(out, -1.0, 1.0, out=out)
+            return out
+        if _is_torchish(arr):
+            arr = _torchish_to_numpy_float32_1d(arr)
+            continue
+        mod = getattr(type(arr), "__module__", "") or ""
+        if mod.startswith("torch") and callable(getattr(arr, "numpy", None)):
+            arr = _torchish_to_numpy_float32_1d(arr)
+            continue
+        try:
+            import torch as _torch
+        except ImportError:
+            _torch = None
+        if _torch is not None and isinstance(arr, _torch.Tensor):
+            arr = _torchish_to_numpy_float32_1d(arr)
+            continue
+        arr = np.asarray(arr, dtype=np.float32)
+
+    raise RuntimeError(
+        "Could not convert generated audio to NumPy (tensor→numpy failed). "
+        "Try: pip install -U numpy torch -- or report torch and numpy versions."
+    )
+
+
 def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
     """Convert a float32 audio signal to 16-bit PCM WAV bytes using stdlib wave.
 
@@ -542,11 +583,8 @@ def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
     import wave as _wave
     import numpy as np
 
-    arr = _to_numpy_mono_1d(audio)
-    if _is_torchish(arr):
-        arr = _torchish_to_numpy_float32_1d(arr)
-    arr = np.asarray(arr, dtype=np.float32)
-    pcm = (arr * 32767.0).clip(-32768, 32767).astype(np.int16)
+    arr = _coerce_wav_float_numpy(audio)
+    pcm = np.clip(np.rint(arr * np.float32(32767.0)), -32768, 32767).astype(np.int16)
     buf = io.BytesIO()
     with _wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
