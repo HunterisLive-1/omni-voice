@@ -733,6 +733,28 @@ def _clone_target_duration_seconds(model, ref_text: str, text: str, ref_wav_path
     return float(pred_sec)
 
 
+def _design_target_duration_seconds(
+    model, text: str, *, speed: float | None = None
+) -> float | None:
+    """Estimate output duration for sound design mode without a reference clip."""
+    txt = (text or "").strip()
+    if not txt:
+        return None
+    try:
+        est = model.duration_estimator
+        tw = float(est.calculate_total_weight(txt))
+    except Exception:
+        return None
+    if tw <= 0:
+        return None
+    # Heuristic conversion from estimator weight to seconds for no-ref generation.
+    # Speed > 1 means faster speech (shorter audio), speed < 1 means slower.
+    base_sec = tw / 10.0
+    if speed is not None and speed > 0:
+        base_sec /= float(speed)
+    return float(max(0.35, min(base_sec, 600.0)))
+
+
 def _wall_clock_estimate_for_progress(
     predicted_output_sec: float | None,
     device_info: str,
@@ -2196,6 +2218,9 @@ def generate_design():
                 call_kw["instruct"] = instruct_combined
             if language:
                 call_kw["language"] = language
+            est_sec = _design_target_duration_seconds(_model, text, speed=speed)
+            if est_sec is not None:
+                call_kw["duration"] = est_sec
             if speed is not None:
                 call_kw["speed"] = speed
 
