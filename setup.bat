@@ -762,9 +762,25 @@ for /f "delims=" %%G in ('nvidia-smi --query-gpu^=name --format^=csv^,noheader 2
     if not defined _GPU_NAME set "_GPU_NAME=%%G"
 )
 
+REM ---- RTX 50-series (Blackwell, sm_120) must use the cu128 build ----
+REM Older cu124/cu121/cu118 wheels have NO sm_120 kernels, so a 5050/5060/5070/
+REM 5080/5090 stays unused and generation crawls on the CPU. Force cu128 no matter
+REM what CUDA version the driver reports, and warn if the driver looks too old.
+set "_REC_BUILD_ORIG=!_REC_BUILD!"
+set "_IS_BLACKWELL=0"
+if defined _GPU_NAME (
+    echo !_GPU_NAME! | findstr /i /c:"RTX 5050" /c:"RTX 5060" /c:"RTX 5070" /c:"RTX 5080" /c:"RTX 5090" >nul
+    if not errorlevel 1 (
+        set "_IS_BLACKWELL=1"
+        set "_REC_BUILD=cu128"
+    )
+)
+
 set "_AUTO=5"
 set "_AUTO_LABEL=CPU only"
-if "!_CUDA_VER!"=="none" (
+set "_USE_GPU=1"
+if "!_CUDA_VER!"=="none" if "!_IS_BLACKWELL!"=="0" set "_USE_GPU=0"
+if "!_USE_GPU!"=="0" (
     echo   No NVIDIA GPU detected.
     echo   -^> Installing CPU build of PyTorch ^(will work but slower^).
 ) else (
@@ -773,7 +789,15 @@ if "!_CUDA_VER!"=="none" (
     ) else (
         echo   NVIDIA GPU found.
     )
-    echo   Driver CUDA version: !_CUDA_VER!
+    if not "!_CUDA_VER!"=="none" echo   Driver CUDA version: !_CUDA_VER!
+    if "!_IS_BLACKWELL!"=="1" (
+        echo   RTX 50-series ^(Blackwell^) detected -^> forcing CUDA 12.8 build ^(only build with sm_120 kernels^).
+        if not "!_REC_BUILD_ORIG!"=="cu128" (
+            echo   WARNING: your NVIDIA driver reports CUDA below 12.8.
+            echo            If the GPU is still not used after install, update the driver:
+            echo            https://www.nvidia.com/drivers  ^(RTX 50-series needs driver 570 or newer^)
+        )
+    )
     if "!_REC_BUILD!"=="cu128" ( set "_AUTO=1" & set "_AUTO_LABEL=CUDA 12.8" )
     if "!_REC_BUILD!"=="cu124" ( set "_AUTO=3" & set "_AUTO_LABEL=CUDA 12.4" )
     if "!_REC_BUILD!"=="cu121" ( set "_AUTO=4" & set "_AUTO_LABEL=CUDA 12.1" )

@@ -63,7 +63,7 @@ except ImportError:
     print("Flask is required for the Web UI. Run:  setup.bat install")
     sys.exit(1)
 
-YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@HunterIsLive-18"
+YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TheHunter-AI"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = int(os.environ.get("OMNIVOICE_PORT", "8765"))
 
