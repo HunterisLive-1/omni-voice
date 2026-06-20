@@ -35,7 +35,7 @@
 
 | Requirement | Details |
 |---|---|
-| **OS** | Windows 10/11 (Linux/macOS: manual install below) |
+| **OS** | Windows 10/11, or macOS (Apple Silicon & Intel). Linux: manual install below. |
 | **Python** | 3.9 – 3.12 — [python.org](https://www.python.org/downloads/) ✔ tick **"Add to PATH"** |
 | **GPU (recommended)** | NVIDIA GPU with CUDA. CPU works but is slow. |
 | **Disk space** | ~6 GB for model weights + ~3 GB for packages |
@@ -99,6 +99,53 @@ setup.bat menu
 ```
 
 This opens the repair tools menu (fix httpx, fix accelerate, deep repair, torch reinstalls, weights download, etc.).
+
+---
+
+## Setup & Run — macOS (Apple Silicon & Intel)
+
+Macs have no NVIDIA CUDA. On **Apple Silicon (M1/M2/M3/M4)** the GPU is used automatically
+via **Metal/MPS**; on **Intel Macs** it runs on the CPU. The same PyTorch wheel covers both.
+
+### Step 1 — Install Python 3 (one-time)
+
+```bash
+brew install python@3.12        # or download from python.org/downloads/macos
+```
+
+### Step 2 — Download this repo
+
+`Code → Download ZIP`, or `git clone https://github.com/HunterIsLive/OmniVoice.git`, then `cd` into the folder.
+
+### Step 3 — Run the one-click setup
+
+```bash
+chmod +x setup.sh run.sh        # first time only — make them runnable
+./setup.sh                      # detects your Mac, installs everything, launches the Web UI
+```
+
+Everything is automatic: creates `.venv`, installs PyTorch (CPU + Apple MPS), installs
+OmniVoice + Flask, downloads the ~2.5 GB weights, then opens **`http://127.0.0.1:8765`**.
+
+### Next time — just use `run.sh`
+
+```bash
+./run.sh
+```
+
+Stop the server with `Ctrl+C`. Repair menu: `./setup.sh menu`.
+
+| Command | Purpose |
+|---|---|
+| `./setup.sh` | Full auto install (or launch if already installed) |
+| `./setup.sh menu` | Repair / tools menu |
+| `./setup.sh verify` | Show torch + whether Apple MPS is active |
+| `./setup.sh weights` | Pre-download model weights |
+| `./setup.sh torchcpu` | Reinstall PyTorch (CPU + Apple MPS) |
+| `./setup.sh deeprepair` / `fixhttpx` / `fixaccelerate` / `repairomni` | Fix broken packages |
+| `./setup.sh update` | Pull latest from GitHub |
+
+> Weights cache on macOS: `~/.cache/huggingface/hub`
 
 ---
 

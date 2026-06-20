@@ -1042,6 +1042,14 @@ def _get_device_dtype():
         print(f"[OmniVoice] {_device_info}", flush=True)
         return "cuda:0", torch.float16
 
+    # Apple Silicon GPU (Metal / MPS) — Macs have no CUDA, so use the integrated GPU.
+    # Keep float32: a few ops still lack fp16 MPS kernels, and run.sh sets
+    # PYTORCH_ENABLE_MPS_FALLBACK=1 so anything unsupported drops to CPU instead of crashing.
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        _device_info = "GPU: Apple Silicon (Metal / MPS)"
+        print(f"[OmniVoice] {_device_info}", flush=True)
+        return "mps", torch.float32
+
     # NVIDIA GPU detected by nvidia-smi but CUDA not usable — give actionable hint
     try:
         r = subprocess.run(

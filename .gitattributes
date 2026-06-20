@@ -2,6 +2,10 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
+# macOS/Linux shell scripts MUST stay LF — CRLF breaks the #! interpreter line
+*.sh text eol=lf
+*.command text eol=lf
+
 # Common text files — normalize to LF in repo, checkout as-is on Windows (auto)
 *.py  text eol=lf
 *.md  text eol=lf
