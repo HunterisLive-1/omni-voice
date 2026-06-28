@@ -17,6 +17,11 @@ REM -----------------------------------------------------------------------
 set "VENV_DIR=%~dp0.venv"
 set "VPY=%VENV_DIR%\Scripts\python.exe"
 
+REM -- 0) Must be running from the real project folder (next to webui.py) ----
+REM    Catches "webui.py not found": run.bat copied on its own, or launched
+REM    from a Windows system folder (e.g. C:\Windows\System32) so %~dp0 is wrong.
+if not exist "%~dp0webui.py" goto :err_wrong_folder
+
 REM -- If any arg is passed, forward to setup.bat (e.g. run.bat verify) --
 if not "%~1"=="" (
   call "%~dp0setup.bat" %*
@@ -59,6 +64,29 @@ if "!RC!"=="0" goto :clean_exit
 goto :err_webui_crashed
 
 REM =======================================================================
+:err_wrong_folder
+echo.
+echo  ============================================================
+echo   ERROR: webui.py was not found next to run.bat
+echo  ============================================================
+echo.
+echo   run.bat is running from:
+echo     %~dp0
+echo.
+echo   It must run from INSIDE the OmniVoice folder -- the same folder
+echo   that contains webui.py, setup.bat and the model files. If you see
+echo   "System32" in the path above, that is the problem.
+echo.
+echo   How to fix:
+echo     1. Extract the WHOLE OmniVoice download to a normal location such
+echo        as your Desktop or Documents ^(NOT inside C:\Windows^).
+echo     2. Open that OmniVoice folder.
+echo     3. Double-click run.bat from there ^(do not "Run as administrator"^).
+echo.
+echo   Full project download:  https://github.com/HunterisLive-1/omni-voice
+echo.
+goto :end_with_pause
+
 :err_no_venv
 echo.
 echo  ============================================================

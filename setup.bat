@@ -12,6 +12,19 @@ if /i "%~1"=="_OV_CHILD_" shift
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
+REM ---------------------------------------------------------------------------
+REM  Safety guard -- prevents the "webui.py not found" error new users hit.
+REM
+REM  setup.bat MUST live inside the OmniVoice project folder, right next to
+REM  webui.py. If it is run on its own, or from a Windows system folder
+REM  (e.g. C:\Windows\System32 -- where "Run as administrator" / an admin cmd
+REM  often starts), then %~dp0 points at the wrong place: .venv gets created in
+REM  that folder and the launcher later fails with
+REM    can't open file '...\webui.py': [Errno 2] No such file or directory
+REM  Stop right here with a clear message instead of that cryptic crash.
+REM ---------------------------------------------------------------------------
+if not exist "%~dp0webui.py" goto :err_wrong_folder
+
 set "VENV_DIR=%~dp0.venv"
 set "VPY=%VENV_DIR%\Scripts\python.exe"
 set "SP=%VENV_DIR%\Lib\site-packages"
@@ -70,6 +83,36 @@ if exist "%VENV_DIR%\Scripts\activate.bat" (
   echo.
 )
 goto :install
+
+REM ===========================================================================
+:err_wrong_folder
+echo.
+echo  ============================================================
+echo   ERROR: webui.py was not found next to setup.bat
+echo  ============================================================
+echo.
+echo   setup.bat is running from:
+echo     %~dp0
+echo.
+echo   It must run from INSIDE the OmniVoice folder -- the same folder
+echo   that contains webui.py, run.bat and the model files.
+echo.
+echo   It looks like setup.bat was copied/extracted on its own, or is
+echo   being run from a Windows system folder ^(e.g. C:\Windows\System32^).
+echo   If you see "System32" in the path above, that is the problem.
+echo.
+echo   How to fix:
+echo     1. Extract the WHOLE OmniVoice download ^(the entire folder^) to a
+echo        normal location such as your Desktop or Documents.
+echo        Do NOT put it inside C:\Windows or C:\Program Files.
+echo     2. Open that OmniVoice folder.
+echo     3. Double-click setup.bat from there ^(do not "Run as administrator"^).
+echo.
+echo   If you only have the .bat files, re-download the full project:
+echo     https://github.com/HunterisLive-1/omni-voice
+echo.
+pause
+exit /b 1
 
 REM ===========================================================================
 :menu
